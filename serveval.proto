@@ -1,0 +1,76 @@
+// The tool, context and fan-out workloads for the gRPC pairs, padded to the HTTP pairs' sizes.
+syntax = "proto3";
+
+package serveval;
+
+service Agent {
+    // Answers one tool call with a 256-byte reply copying its id and `after + top_k`.
+    rpc Tool(ToolCall) returns (ToolReply);
+    // Answers the first 256 bytes of the data unchanged.
+    rpc Raw(Chunk) returns (Chunk);
+    // Answers `Tool` behind the `authorization` and `traceparent` metadata entries, copying the trace id too.
+    rpc Full(ToolCall) returns (ToolReply);
+    // Counts the bytes of a streamed context upload.
+    rpc Context(stream Chunk) returns (Count);
+    // Forwards the call to `width` upstream Tool services, taken from the `width` metadata entry.
+    rpc Fanout(ToolCall) returns (ToolReply);
+    rpc Health(Empty) returns (HealthReply);
+    rpc Stats(Empty) returns (StatsReply);
+}
+
+// Encodes to exactly 1024 bytes, `trace` absorbing the padding.
+message ToolCall {
+    string id = 1;
+    string type = 2;
+    string name = 3;
+    Arguments arguments = 4;
+    string trace = 5;
+}
+
+message Arguments {
+    string query = 1;
+    uint32 top_k = 2;
+    Filters filters = 3;
+}
+
+message Filters {
+    string lang = 1;
+    // Unix seconds.
+    uint64 after = 2;
+}
+
+// Encodes to exactly 256 bytes, `content` absorbing the padding.
+message ToolReply {
+    string id = 1;
+    bool ok = 2;
+    bytes content = 3;
+    uint64 check = 4;
+    // The trace id of a `Full` call, empty otherwise.
+    string trace = 5;
+}
+
+message Chunk {
+    bytes data = 1;
+}
+
+message Count {
+    fixed64 bytes = 1;
+}
+
+message Empty {}
+
+message HealthReply {
+    string framework = 1;
+    string client = 2;
+    bool batching = 3;
+}
+
+// The server's own cgroup: unset where the platform has no cgroup v2.
+message StatsReply {
+    optional uint64 cpu_microseconds = 1;
+    optional uint64 memory_bytes = 2;
+    uint64 cores = 3;
+    optional uint64 memory_limit = 4;
+    // TCP connections this box opened since boot, every process together.
+    optional uint64 tcp_active_opens = 5;
+}

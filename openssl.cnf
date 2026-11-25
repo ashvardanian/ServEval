@@ -1,0 +1,14 @@
+# TLS policy for the Python servers through OPENSSL_CONF: TLS 1.3, AES-256-GCM, X25519, no tickets.
+openssl_conf = serveval
+
+[serveval]
+ssl_conf = serveval_ssl
+
+[serveval_ssl]
+system_default = serveval_tls
+
+[serveval_tls]
+MinProtocol = TLSv1.3
+Ciphersuites = TLS_AES_256_GCM_SHA384
+Groups = X25519
+NumTickets = 0

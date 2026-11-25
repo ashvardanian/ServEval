@@ -1,0 +1,14 @@
+/target/
+/results/
+/plots/
+/build_*/
+/.venv/
+/.ruff_cache/
+/LOG.md
+data/*
+!data/.gitkeep
+__pycache__/
+*.pyc
+*.tmp
+.DS_Store
+/CMakeUserPresets.json

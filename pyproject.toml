@@ -1,0 +1,24 @@
+[project]
+name = "serveval"
+version = "1.0.0-rc.1"
+description = "Agentic-scale serving benchmarks, each framework driven by its own client"
+requires-python = ">=3.12"
+dependencies = []
+
+# One group per framework, so one framework's pins cannot break another's.
+[dependency-groups]
+fastapi = ["fastapi", "uvicorn", "uvloop", "httptools", "httpx"]
+litserve = ["litserve", "httpx"]
+rayserve = ["ray[serve]", "httpx"]
+httpx = ["httpx"]
+grpc = ["grpcio", "grpcio-tools"]
+# The UCall pair runs on free-threaded CPython: `uv run --python 3.14t --group ucall python ucall_server.py`.
+ucall = ["ucall @ git+https://github.com/unum-cloud/UCall@65fb9cc2c9275f43372d4889c2c2861a511e0055"]
+dev = ["ruff"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["I"]

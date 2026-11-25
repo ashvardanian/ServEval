@@ -1,0 +1,51 @@
+name: CPU Checks
+on: [push, pull_request]
+jobs:
+  check:
+    name: Check ${{ matrix.name }}
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: axum and hyper
+            features: axum
+            server: serv-eval-axum-server
+            client: serv-eval-hyper-client
+          - name: actix-web and awc
+            features: actix
+            server: serv-eval-actix-server
+            client: serv-eval-awc-client
+          - name: tonic
+            features: tonic
+            server: serv-eval-tonic-server
+            client: serv-eval-tonic-client
+    steps:
+      - name: Check Out Repository
+        uses: actions/checkout@v7
+      - name: Install Rust 1.100 with Rustfmt and Clippy
+        run: rustup toolchain install 1.100 --profile minimal --component rustfmt,clippy
+      - name: Install Protobuf Compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Set Up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.4"
+      - name: Check Rust Formatting
+        run: cargo fmt --all -- --check
+      - name: Check Python Style
+        run: uvx ruff check && uvx ruff format --check
+      - name: Check Python Plotting
+        run: uvx ruff check scripts/plot.py && uvx ruff format --check scripts/plot.py && python3 scripts/plot.py --help
+      - name: Lint ${{ matrix.name }}
+        run: cargo clippy --locked --no-default-features --features ${{ matrix.features }} --all-targets -- -D warnings
+      - name: Pin Payload Digests and Report Hashes in Both Languages
+        run: cargo test --locked --no-default-features --features ${{ matrix.features }} --lib && python3 payloads.py
+      - name: Build ${{ matrix.name }}
+        run: cargo build --locked --release --no-default-features --features ${{ matrix.features }}
+      - name: Byte-Compile Python Pairs
+        run: python3 -m py_compile *.py scripts/plot.py
+      - name: Print the Help of ${{ matrix.name }}
+        run: target/release/${{ matrix.server }} --help && target/release/${{ matrix.client }} --help
+      - name: Exchange ${{ matrix.name }} on Loopback
+        run: ./launch.py --smoke target/release/${{ matrix.client }} -- target/release/${{ matrix.server }}
