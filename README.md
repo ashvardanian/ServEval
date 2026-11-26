@@ -47,7 +47,6 @@ sudo -E ./launch.py --layout per-domain -- target/release/serv-eval-hyper-client
 
 | Server                   | Client     | Language | Batching       | Security          |
 | :----------------------- | :--------- | :------- | :------------- | :---------------- |
-| `ucall_server.cpp`       | UCall      | C++      | `/tool/batch`  | Noise IK and XX   |
 | `ucall_server.rs`        | UCall      | Rust     | `/tool/batch`  | Noise IK and XX   |
 | `ucall_server.py`        | UCall      | Python   | `/tool/batch`  | Noise IK and XX   |
 | `serv-eval-axum-server`  | hyper      | Rust     | none           | rustls TLS 1.3    |
@@ -58,8 +57,7 @@ sudo -E ./launch.py --layout per-domain -- target/release/serv-eval-hyper-client
 | `rayserve_server.py`     | httpx      | Python   | `@serve.batch` | OpenSSL TLS 1.3   |
 | `grpc_server.py`         | grpc.aio   | Python   | none           | BoringSSL TLS 1.3 |
 
-The three UCall pairs fetch UCall at a pinned commit and write the same reports.
-The C++ pair builds with `cmake --preset release && cmake --build build_release`, into `serv-eval-ucall-server` and `serv-eval-ucall-client`.
+The two UCall pairs fetch UCall at a pinned commit and write the same reports; UCall's own C++ benchmarks live in UCall.
 The Rust pair builds behind the `ucall` feature, on by default, and the Python pair runs on free-threaded CPython with `uv run --python 3.14t --group ucall`.
 Clients are named by the library they are: `serv-eval-hyper-client`, `serv-eval-awc-client`, `serv-eval-tonic-client`, `httpx_client.py` and `grpc_client.py`.
 `httpx_client.py` serves FastAPI, LitServe and Ray Serve, reading the framework from `/health`.
