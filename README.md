@@ -45,21 +45,21 @@ sudo -E ./launch.py --layout per-domain -- target/release/serv-eval-hyper-client
 
 ## Backends
 
-| Server                   | Client     | Language | Batching       | Security          |
-| :----------------------- | :--------- | :------- | :------------- | :---------------- |
-| `ucall_server.rs`        | UCall      | Rust     | `/tool/batch`  | Noise IK and XX   |
-| `ucall_server.py`        | UCall      | Python   | `/tool/batch`  | Noise IK and XX   |
-| `serv-eval-axum-server`  | hyper      | Rust     | none           | rustls TLS 1.3    |
-| `serv-eval-actix-server` | awc        | Rust     | none           | rustls TLS 1.3    |
-| `serv-eval-tonic-server` | tonic      | Rust     | none           | rustls TLS 1.3    |
-| `fastapi_server.py`      | httpx      | Python   | none           | OpenSSL TLS 1.3   |
-| `litserve_server.py`     | httpx      | Python   | `/tool/batch`  | OpenSSL TLS 1.3   |
-| `rayserve_server.py`     | httpx      | Python   | `@serve.batch` | OpenSSL TLS 1.3   |
-| `grpc_server.py`         | grpc.aio   | Python   | none           | BoringSSL TLS 1.3 |
+| Framework | Language | Server               | Client             | Batching       | Security          |
+| :-------- | :------- | :------------------- | :----------------- | :------------- | :---------------- |
+| UCall     | Rust     | `ucall_server.rs`    | `ucall_client.rs`  | `/tool/batch`  | Noise IK and XX   |
+| UCall     | Python   | `ucall_server.py`    | `ucall_client.py`  | `/tool/batch`  | Noise IK and XX   |
+| axum      | Rust     | `axum_server.rs`     | `hyper_client.rs`  | none           | rustls TLS 1.3    |
+| actix-web | Rust     | `actix_server.rs`    | `awc_client.rs`    | none           | rustls TLS 1.3    |
+| tonic     | Rust     | `tonic_server.rs`    | `tonic_client.rs`  | none           | rustls TLS 1.3    |
+| FastAPI   | Python   | `fastapi_server.py`  | `httpx_client.py`  | none           | OpenSSL TLS 1.3   |
+| LitServe  | Python   | `litserve_server.py` | `httpx_client.py`  | `/tool/batch`  | OpenSSL TLS 1.3   |
+| Ray Serve | Python   | `rayserve_server.py` | `httpx_client.py`  | `@serve.batch` | OpenSSL TLS 1.3   |
+| grpc.aio  | Python   | `grpc_server.py`     | `grpc_client.py`   | none           | BoringSSL TLS 1.3 |
 
+Each Rust source builds the binary `serv-eval-` plus its name with dashes, like `serv-eval-axum-server` from `axum_server.rs`, and each client is named for the library it uses.
 The two UCall pairs fetch UCall at a pinned commit and write the same reports; UCall's own C++ benchmarks live in UCall.
 The Rust pair builds behind the `ucall` feature, on by default, and the Python pair runs on free-threaded CPython with `uv run --python 3.14t --group ucall`.
-Clients are named by the library they are: `serv-eval-hyper-client`, `serv-eval-awc-client`, `serv-eval-tonic-client`, `httpx_client.py` and `grpc_client.py`.
 `httpx_client.py` serves FastAPI, LitServe and Ray Serve, reading the framework from `/health`.
 The Rust pairs build behind the `axum`, `actix` and `tonic` features, all on by default; `cargo build --release --no-default-features --features axum` builds one.
 
@@ -208,19 +208,21 @@ The same tool calls swept over 64, 10K and 1M connections, from one loopback box
 
 Every server and client, in every language, takes the same flags.
 A value spelled `<…,...>` takes comma-separated values and runs one configuration per combination: clients sweep their own, and `launch.py` sweeps the server's.
+A value spelled in the plural, like `<INTERFACES>`, is a comma-separated list that every configuration uses whole.
 A combination a pair cannot run is still a row, with `unsupported` naming the reason and zeros where it would have measured, never a silent skip: batched uploads and downloads, a batched call to a server without a batcher, more calls in flight than a client multiplexes, or a route the server answers with 404, 405, 501 or gRPC's `UNIMPLEMENTED`.
 Counts read `64`, `10K` or `1M` in powers of 1000, sizes read `256KB` or `4MB` in powers of 1024, and durations read `200ms` or `10s`.
 Each client prints every setting at the start, as `- Name: value` in the same grammar the flag reads, then its cores and memory limit.
 A bad value prints `--flag="value" does not parse, expected …` and exits with status 1.
 Every flag also reads `SERVEVAL_<FLAG>` as its default, upper-cased with dashes as underscores, so `--time-limit` reads `SERVEVAL_TIME_LIMIT`.
+The flag on the command line overrides the variable.
 
 ```text
 Servers and clients
   --threads <N>                         0
       Workers, 0 for every core in the affinity mask: Tokio, actix and awc threads, httpx and grpc.aio client
       processes, Uvicorn and LitServe workers, Ray Serve replicas and gRPC server processes.
-  --interfaces <INTERFACE,...>          127.0.0.1
-      DEVICE=ADDRESS or ADDRESS, extra addresses joined by +.
+  --interfaces <INTERFACES>             127.0.0.1
+      Each DEVICE=ADDRESS or ADDRESS, extra addresses joined by +.
   --port <PORT>                         8545
       Port every server listens on.
   --security <MODE>                     none
@@ -236,22 +238,22 @@ Servers and clients
       Context upload and download sizes; a server prepares the largest once for its downloads.
 
 Servers
-  --upstreams <ADDRESS:PORT,...>        none
-      Fan-out targets.
+  --upstreams <UPSTREAMS>               none
+      Fan-out targets, each ADDRESS:PORT.
   --batch-size <N>                      32
       Most calls one batch gathers, passed explicitly because the frameworks' defaults differ widely.
   --batch-wait <DURATION>               10ms
       Longest a batch waits to fill.
 
 Clients
-  --targets <ADDRESS,...>               127.0.0.1
+  --targets <ADDRESSES>                 127.0.0.1
       Server addresses, paired with --interfaces by position.
   --workloads <WORKLOAD,...>            tool,context,download,fanout
   --variants <VARIANT,...>              plain,batched
   --phases <PHASE,...>                  steady,handshake
   --parsing <SHAPE,...>                 body
       raw, body or full, swept only for plain tool calls.
-  --calls-in-flight-per-connection <N,...|server-maximum>   1
+  --calls-in-flight-per-connection <N|server-maximum,...>   1
       Calls each connection keeps outstanding, or the server's advertised stream or pipelining limit, RFC 9113's
       minimum of 100 when it advertises none.
   --calls-per-second <N>                none
@@ -270,14 +272,15 @@ Clients
       Directory for JSON reports.
 ```
 
-`launch.py` takes the same `SERVEVAL_<FLAG>` defaults for its own flags:
+`launch.py` reads its own flags' `SERVEVAL_<FLAG>` defaults the same way, from `--port` on:
 
 ```text
   --layout <LAYOUT>                     one
       one, or per-domain for one process per interface on its NIC's memory domain.
   --copies <N>                          1
       Copies of a server on adjacent ports, for fan-out upstreams.
-  --port <PORT>                         SERVEVAL_PORT
+  --port <PORT>                         8545
+      First port of the servers it starts, each copy on the next.
   --server-cores-per-network-interface <N,...>   none
       Cores each server process gets per interface: the first N of the interface's memory domain past the
       housekeeping cores, inside the launcher's affinity mask, pinned to no network device's interrupt. A server
@@ -289,7 +292,7 @@ Clients
       it once per pass, then the server stopped.
   --server-host <SSH DESTINATION>       this box
       Where the pair starts its server, through this launcher at the same path and Python.
-  --server-interfaces <INTERFACE,...>   the client's
+  --server-interfaces <INTERFACES>      the client's
       The pair server's SERVEVAL_INTERFACES; a wildcard address stands for the devices holding the targets.
   --client <PROGRAM,...>                the program after --
       Clients to sweep against one listening server, each replacing the program before the flags after --.
@@ -301,42 +304,66 @@ Clients
 
 Every client prints one JSON report per configuration to stdout, a Markdown row to stderr, and writes `results/<framework>-<config-hash>.json` atomically, flushed to the drive before it replaces an older one.
 The hash is FNV-1a over the compact JSON of `config`, identical in Rust and Python.
+The row below is the Rust UCall pair's plain tool calls over 256 connections from the AWS Graviton4 run of November 26, 2026, with only its histogram buckets cut short.
 
 ```json
 {
-  "schema_version": 2, "started_unix_seconds": 1795046400,
-  "machine": { "cpu_model": "Intel Xeon 6776P", "logical_cores": 192, "physical_cores": 96, "ram_bytes": 1099511627776,
-               "kernel": "6.17.0", "os": "Linux (Ubuntu 26.04)", "architecture": "x86_64",
+  "schema_version": 3, "started_unix_seconds": 1795670850,
+  "machine": { "cpu_model": "Neoverse-V2", "logical_cores": 192, "physical_cores": 192, "ram_bytes": 404875616256,
+               "kernel": "7.0.0-1018-aws", "os": "Linux (Ubuntu 26.04)", "architecture": "aarch64",
                "kernel_limits": { "fs.nr_open": "4194304", "net.core.somaxconn": "65535",
                                   "net.ipv4.ip_local_port_range": "1024 65535", "net.ipv4.tcp_max_syn_backlog": "65535",
-                                  "net.ipv4.tcp_max_tw_buckets": "2097152", "net.ipv4.tcp_rmem": "4096 131072 6291456",
+                                  "net.ipv4.tcp_max_tw_buckets": "2000000", "net.ipv4.tcp_rmem": "4096 131072 33554432",
                                   "net.ipv4.tcp_tw_reuse": "1", "net.ipv4.tcp_wmem": "4096 16384 4194304",
-                                  "net.netfilter.nf_conntrack_max": null },
-               "budget": { "cores": 8, "cpus": "8-15", "memory_limit": 17179869184 } },
-  "config": { "framework": "axum", "client": "hyper", "language": "rust", "workload": "tool", "variant": "plain",
-              "parsing": "body", "security": "tls13", "phase": "steady", "process": 0, "processes": 1, "interfaces": 1,
-              "threads": 8, "connections": 10000, "in_flight": 10000, "pipeline_depth": 1, "body_bytes": 0, "width": 8,
-              "offered_calls_per_second": null, "seed": 42, "between_runs": "reconnect" },
-  "ucall_commit": null, "tls_suite": "TLS13_AES_256_GCM_SHA384", "domains": null,
-  "seconds": 10.0, "window_unix_ms": [1795046401100, 1795046411100],
-  "calls": 4210000, "errors": 0,
+                                  "net.netfilter.nf_conntrack_max": "1048576" },
+               "budget": { "cores": 128, "cpus": "0-63,96-159", "memory_limit": 395693158400 } },
+  "config": { "framework": "ucall", "client": "ucall", "language": "rust", "test": "latency", "workload": "tool",
+              "variant": "plain", "parsing": "body", "security": "none", "phase": "steady", "process": 0,
+              "processes": 1, "interfaces": 2, "threads": 128, "connections": 256,
+              "calls_in_flight_per_connection": 1, "calls_in_flight_per_connection_source": "flag", "in_flight": 256,
+              "pipeline_depth": 1, "body_bytes": 0, "width": 8, "offered_calls_per_second": null,
+              "server_cores_per_network_interface": 4, "seed": 42, "between_runs": "reconnect" },
+  "unsupported": null, "tls_suite": null, "domains": null,
+  "seconds": 10.0, "window_unix_ms": [1795670852464, 1795670862464],
+  "calls": 9769884, "errors": 0,
   "error_classes": { "connect": 0, "refused": 0, "timeout": 0, "status": 0, "wrong_reply": 0 },
-  "unsent": 0, "all_calls": 4630000,
-  "request_body_bytes": 4311040000, "response_body_bytes": 1077760000, "reconnects": 0, "upstream_connections": 0,
-  "server_cpu_microseconds": 39800000, "server_memory_bytes": 412000000, "client_cpu_seconds": 61.2,
-  "calls_per_second": 421000.0, "body_gigabytes_per_second": 0.539,
-  "latency_us": { "p50": 22.5, "p90": 31.7, "p99": 55.3, "p999": 98.3, "max": 1015.8 },
-  "latency_buckets": [[248, 1210], [249, 3051], "..."],
-  "send_lateness_us": { "p50": 0.2, "p90": 0.4, "p99": 0.9, "p999": 2.1, "max": 40.3 },
-  "send_lateness_buckets": [[120, 980], [121, 2210], "..."],
-  "server_cpu_us_per_call": 8.6, "server_kb_per_connection": 40.2, "client_cpu_percent": 556.4,
-  "client_cpu_share": 0.696, "client_limited": false,
-  "server_budget": { "cores": 4, "memory_limit": 8589934592 }
+  "unsent": 0, "all_calls": 11726221,
+  "request_body_bytes": 10004361216, "response_body_bytes": 2501090304, "reconnects": 260, "upstream_connections": 158,
+  "server_units": ["serveval-server-ucall-8545-0.service"], "server_cpu_list": "8-11,104-107", "server_cores": 8,
+  "server_memory_limit": null, "server_cpu_microseconds": 82888821,
+  "server_memory_peak_bytes": 249774080, "server_memory_idle_peak_bytes": 102551552,
+  "client_cpu_seconds": 139.200314, "calls_per_second": 976988.4, "calls_per_second_per_server_core": 122123.55,
+  "body_gigabytes_per_second": 1.250545152,
+  "latency_us": { "p50": 253.951, "p90": 376.831, "p99": 491.519, "p999": 589.823, "max": 950.271 },
+  "latency_buckets": [[208, 2], [209, 3], "..."],
+  "send_lateness_us": { "p50": 0.071, "p90": 0.071, "p99": 0.271, "p999": 0.287, "max": 32.767 },
+  "send_lateness_buckets": [[46, 28], [47, 228], "..."],
+  "server_cpu_microseconds_per_call": 7.068672933931571,
+  "client_cpu_microseconds_per_call": 11.870858821439576,
+  "server_busy_share": 0.8632514324806388, "server_kilobytes_per_connection": 561.609375,
+  "server_event_loop_counters": { "accepts": 514, "bytes_copied": 16751078798, "bytes_received": 13749124555,
+                                  "bytes_sent": 4737471845, "completions": 23455877, "copying_sends": 11726479,
+                                  "empty_polls": 8, "kernel_enters": 443803, "polls": 445369,
+                                  "ready_passes": 13879091, "receive_rearms": 0, "requests": 11726479,
+                                  "submissions": 23455619, "zero_copy_sends": 0 },
+  "server_event_loop_counters_per_request": { "accepts": 4.383242403794012e-05, "bytes_copied": 1428.4832470172846,
+                                            "bytes_received": 1172.4853261580054, "bytes_sent": 403.9978108518337,
+                                            "completions": 2.000248923824449, "copying_sends": 1.0,
+                                            "empty_polls": 6.82216716543815e-07,
+                                            "kernel_enters": 0.037846228181536844, "polls": 0.0379797721038003,
+                                            "ready_passes": 1.1835684863291018, "requests": 1.0,
+                                            "submissions": 2.0002269223353406 },
+  "client_cpu_percent": 1160.0026166666667, "client_cpu_share": 0.09062520442708333, "client_limited": false
 }
 ```
 
-The layout is schema version 2, which `scripts/plot.py` checks.
-`machine.budget` is the client's affinity mask and memory limit, and `server_budget` the servers' summed over the targets.
+The layout is schema version 3, which `scripts/plot.py` checks; it still reads version 2 rows and their older names, like `server_cpu_us_per_call` and `server_kb_per_connection`.
+`machine.budget` is the client's affinity mask and memory limit.
+`server_cores` and `server_memory_limit` are the servers' affinity cores and smallest `memory.max`, summed over the targets, `server_cpu_list` the union of their cores, and `server_units` the systemd units measured, each once.
+`unsupported` names why a configuration could not run, null when it ran.
+`config.test` is `latency` for a plain row with one call in flight per connection, and `throughput` for a batched row or one with more.
+`config.calls_in_flight_per_connection` is the depth the row ran, and `config.calls_in_flight_per_connection_source` says where it came from: `flag`, `server-advertised` for `server-maximum` reading the server's limit, or `rfc9113-minimum` for a server that advertises none.
+`config.server_cores_per_network_interface` is the `--server-cores-per-network-interface` the servers ran under, as `launch.py` passes it to the client, null when none was given.
 `machine.kernel_limits` holds the sysctls that cap connection counts and socket memory, `null` where `/proc/sys` lacks one.
 `config.parsing` names the request shape, and is `body` for every workload but plain tool calls.
 `config.client` names the client program that measured the row, so a client driving another stack's server still names itself, and `config.framework` names the server from its `/health`.
@@ -345,18 +372,20 @@ The layout is schema version 2, which `scripts/plot.py` checks.
 `error_classes` splits `errors` into connect, refused, timeout, status and wrong reply, the last counting replies that differ from the expected bytes.
 `unsent` counts calls scheduled inside the window that never went out, and `send_lateness_us` how late the sent ones left against their intended send time.
 `client_cpu_share` is the client's CPU time as a share of its own cores, from 0 to 1.
-`client_limited` is true when under 99% of the offered rate went out, or when the p99 send lateness exceeds 5% of the p50 latency, so the row measured the client rather than the server.
-`server_busy_share` is the server's CPU per call times the window's calls per second, failed ones included, as a share of the serving cores: 1 means the rate kept every serving core busy.
-Well below 1, calls per second per server core is not the server's capacity: a client whose threads contend, too few calls in flight, or a lock the server sleeps on held it back, and `client_limited` cannot tell those apart.
+`client_limited` is true when under 99% of the offered rate went out, when the p99 send lateness exceeds 5% of the p50 latency, or when the client used over 90% of its own cores, so the row measured the client rather than the server.
+`server_busy_share` is `server_cpu_microseconds_per_call` times the window's calls per second, failed ones included, as a share of `server_cores`: 1 means the rate kept every serving core busy.
+Well below 1, `calls_per_second_per_server_core` is not the server's capacity: a client whose threads contend, too few calls in flight, or a lock the server sleeps on held it back, and `client_limited` cannot tell those apart.
 `request_body_bytes` and `response_body_bytes` count bodies only, without headers or framing, and `body_gigabytes_per_second` divides their sum by the window, printed as Body GB/s.
 `reconnects` counts the TCP connections the client's box opened over the window, warmup included, and `upstream_connections` those the server's box opened from before connecting to the end, like fan-out upstreams.
 Both read `ActiveOpens` from `/proc/net/snmp`, so they count TCP opens box-wide, any other process on the box included.
 A steady row with nonzero `reconnects` lost connections it was meant to reuse.
 Latency buckets are the sparse histogram, 16 linear bins per power of two nanoseconds, so percentiles merge exactly across processes and languages.
 Open-loop latency counts from each call's intended send time, so a queueing server cannot hide its backlog.
-Servers answer `GET /stats` from their own cgroup v2 `cpu.stat` and `memory.current`, which cover every worker process and the kernel's socket memory.
-Server CPU per call divides the server's CPU time by every call including the warmup, and memory per connection divides the growth since before connecting.
-Memory per connection holds only under `--between-runs reconnect`, since `keep` samples the server with the earlier connections already open.
+Servers answer `GET /stats` from their own cgroup v2 `cpu.stat`, `memory.current` and `memory.peak`, which cover every worker process and the kernel's socket memory.
+`server_cpu_microseconds_per_call` and `client_cpu_microseconds_per_call` divide each side's CPU time by every call including the warmup.
+`server_memory_idle_peak_bytes` is the servers' `memory.peak` over the idle time before connecting, and `server_memory_peak_bytes` from before connecting to the window's end.
+`server_kilobytes_per_connection` divides the growth of the peak over the idle peak by the connections, and holds only under `--between-runs reconnect`, since `keep` samples the server with the earlier connections already open.
+`server_event_loop_counters` is the growth of the serving library's own event-loop counters over the warmup and window, like UCall's `kernel_enters`, null for libraries that keep none, and `server_event_loop_counters_per_request` divides each nonzero one by `requests`.
 `launch.py` merges the reports of several client processes into one, counting every interface and memory domain it placed them on.
 Compare only reports with the same machine, connections, security, phase and parsing.
 
@@ -387,15 +416,16 @@ The files sit flat at the root on purpose: every pair is one server and one clie
 - `results.rs` and `results.py` assemble, print and atomically write the reports.
 - `stats.rs` and `stats.py` hold the latency histograms, the call schedule and the cgroup counters.
 - `security.rs` and `security.py` set up TLS 1.3.
-- `serveval.proto` defines the gRPC messages, and `build.rs` generates them for tonic.
-- `axum_server.rs`, `actix_server.rs` and `tonic_server.rs` are the Rust servers.
-- `hyper_client.rs`, `awc_client.rs` and `tonic_client.rs` are the Rust clients.
-- `fastapi_server.py`, `litserve_server.py`, `rayserve_server.py` and `grpc_server.py` are the Python servers.
-- `httpx_client.py` and `grpc_client.py` are the Python clients.
+- `serveval.proto` defines the gRPC messages, and `build.rs` generates them for tonic and names the UCall tree the UCall pair links.
+- `ucall_server.rs`, `axum_server.rs`, `actix_server.rs` and `tonic_server.rs` are the Rust servers.
+- `ucall_client.rs`, `hyper_client.rs`, `awc_client.rs` and `tonic_client.rs` are the Rust clients.
+- `ucall_server.py`, `fastapi_server.py`, `litserve_server.py`, `rayserve_server.py` and `grpc_server.py` are the Python servers.
+- `ucall_client.py`, `httpx_client.py` and `grpc_client.py` are the Python clients.
 - `launch.py` places servers and clients on cores, memory and NICs, and merges multi-process reports.
 - `keys.sh` and `openssl.cnf` write the keys and pin the TLS policy.
 - `scripts/record.sh` samples the NIC, socket and CPU counters that void throttled rows.
 - `scripts/plot.py` prints and plots the reports, setting void rows apart.
+- `scripts/article.py` draws the article's figures from the rows measured so far, with an index and the headline numbers.
 
 ## Benchmark Pitfalls
 
@@ -429,6 +459,9 @@ The following planned capabilities remain incomplete:
 The repository pins Rust 1.100.
 CI runs formatting, Ruff, `cargo clippy`, `cargo test --lib` and a loopback exchange per Rust feature.
 The tonic pair needs `protoc` on `PATH`, and `grpc_server.py` loads `serveval.proto` through `grpcio-tools` at startup.
+The UCall pairs build against the pinned UCall, which a local `.cargo/config.toml` may point at a sibling checkout.
+The Python UCall pair keeps its free-threaded environment apart, as `.venv-ucall`, so it never shares pins with the other groups:
+`UV_PROJECT_ENVIRONMENT=.venv-ucall uv sync --python 3.14t --group ucall` makes it, `uv pip install --python .venv-ucall ../UCall` swaps in a sibling checkout, and `.venv-ucall/bin/python` runs its server and client.
 Arm the hooks once per clone with `git config core.hooksPath .githooks`.
 The pre-commit hook checks the staged lines against the house style, with rustfmt, Ruff and markdownlint where they are installed.
 

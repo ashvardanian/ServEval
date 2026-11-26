@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = ["matplotlib>=3.9"]
 # ///
 """Draws the article's figures from the rows measured so far and writes INDEX.md and NUMBERS.md beside them.
@@ -478,7 +478,7 @@ def main() -> None:
         for patch in patches:
             digest = file_digest(arguments.patches / patch) if arguments.patches else "not hashed, no --patches"
             index.append(f"- UCall step patch `{patch}`: sha256 `{digest}`, applied as `{steps}` records")
-    index.append("- Rows record `ucall_commit` where the client knew it; each figure lists the values its rows hold.\n")
+    index.append("")
     index.append("## Machines and Box Settings\n")
     for name in ("machine-client.txt", "machine-server.txt", "box-settings.md", "box-settings-server.md"):
         path = arguments.run / name
@@ -527,12 +527,8 @@ def main() -> None:
             index.append(f"- Figure `{svg}`, rows and configuration in `{svg.with_suffix('.md')}`")
         if not svgs:
             index.append("- No chart: none of the rows read matches this figure")
-        commits = sorted({str(row.get("ucall_commit")) for row in rows})
         left_out = [row for row in rows if plot.status(row)]
-        index.append(
-            f"- Rows read: {len(rows)}, of which {len(left_out)} are not framework results; "
-            f"`ucall_commit` values: {', '.join(commits)}"
-        )
+        index.append(f"- Rows read: {len(rows)}, of which {len(left_out)} are not framework results")
         index.append(f"- Every row with its network figures: `{rows_directory / (figure + '.json')}`\n")
         commands: dict[str, set[str]] = {}
         for row in rows:

@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = ["matplotlib>=3.9"]
 # ///
 """Print ServEval JSON reports as one Markdown table per test, or plot them as SVG with --output.

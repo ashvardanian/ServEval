@@ -1,8 +1,8 @@
 /target/
+/.cargo/config.toml
 /results/
 /plots/
-/build_*/
-/.venv/
+/.venv*/
 /.ruff_cache/
 /LOG.md
 data/*

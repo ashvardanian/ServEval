@@ -192,7 +192,6 @@ pub struct ConfigReport<'a> {
     pub config: Config,
     /// Why the configuration could not run, `None` when it ran; such a row measured nothing and holds zeros.
     pub unsupported: Option<&'static str>,
-    pub ucall_commit: Option<String>,
     pub tls_suite: Option<String>,
     /// Distinct memory domains of the client's interfaces, filled in by launch.py when it merges processes.
     pub domains: Option<usize>,
@@ -383,7 +382,6 @@ impl Report {
             machine: &self.machine,
             config: self.config(args, run),
             unsupported: Some(reason),
-            ucall_commit: None,
             tls_suite: None,
             domains: None,
             seconds: 0.0,
@@ -478,7 +476,6 @@ impl Report {
             machine: &self.machine,
             config: self.config(args, run),
             unsupported: None,
-            ucall_commit: None,
             tls_suite: crate::security::negotiated_suite(),
             domains: None,
             seconds: window_seconds,

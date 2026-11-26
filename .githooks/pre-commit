@@ -21,9 +21,9 @@ rejection_count=0
 project_name="ServEval"
 abbreviations_refused="hi lo bot acc accum tmp temp res bcast ext idx cnt buf val obj elem"
 # Name prefixes of third-party APIs the code calls, whose abbreviations are not this project's to spell out.
-third_party_identifier_prefixes='yyjson_'
+third_party_identifier_prefixes=''
 rustfmt_command="cargo fmt"
-ruff_lint_options="--target-version py311 --extend-select I"
+ruff_lint_options="--target-version py312 --extend-select I"
 
 # endregion Project Settings
 
@@ -295,15 +295,13 @@ check_proper_names_capitalized() {
 
 # Rejects an abbreviation from `abbreviations_refused`, such as `hi` or `lo` for register halves, because
 # names and prose spell words out. A bare one in a comment always fires; in code only a name new since HEAD
-# fires, so touching a line never forces a rename the commit is not about. A path HEAD lacks, whether new or a
-# rename git cannot pair, is weighed against every name in HEAD's headers, as it reuses the library's types.
+# fires, so touching a line never forces a rename the commit is not about; in a path HEAD lacks, every name is new.
 # A capitalized macro the file does not define, like the kernel's `RISCV_HWPROBE_EXT_ZABHA`, belongs to another
 # project and never fires, as do literal contents, names the standard qualifies as `std::align_val_t`, and names
 # under `third_party_identifier_prefixes`.
 check_abbreviations_spelled_out() {
     local abbreviated previous_text
-    previous_text=$(git show "HEAD:$staged_path" 2> /dev/null) ||
-        previous_text=${head_header_names:=$(git grep -h -o -w -E '[A-Za-z_][A-Za-z0-9_]*' HEAD -- include | sort -u)}
+    previous_text=$(git show "HEAD:$staged_path" 2> /dev/null) || previous_text=""
     abbreviated=$("$fastest_awk" -v abbreviations="$abbreviations_refused" -v third_party="$third_party_identifier_prefixes" '
         BEGIN {
             count = split(abbreviations, words, " "); for (word = 1; word <= count; ++word) banned[words[word]] = 1
