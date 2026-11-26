@@ -366,7 +366,14 @@ def server_parser(description: str) -> argparse.ArgumentParser:
     )
     add_flag(parser, "--upstreams", None, type=list_of(parse_upstream), help="Fan-out targets as ADDRESS:PORT.")
     add_flag(parser, "--batch-size", "32", type=parse_count, help="Most calls one batch gathers.")
-    add_flag(parser, "--batch-wait", "10ms", type=parse_duration, help="Longest a batch waits to fill.")
+    add_flag(
+        parser,
+        "--batch-wait",
+        "10ms",
+        type=parse_duration,
+        help="Longest a partial batch's oldest call waits before it fires. The UCall servers fire it on the next poll "
+        "after that, at most one poll slice later: the smaller of this wait and POLL_SLICE, 100 ms.",
+    )
     _body_bytes(parser)
     return parser
 

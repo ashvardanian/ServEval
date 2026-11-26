@@ -6,7 +6,8 @@ free-threaded CPython, so the loops serve in parallel.
 
 UCall starts no threads, so this program places its own. Python has no ForkUnion binding, so each polling thread pins
 itself to one core of the affinity mask local to the memory domain UCall reports for its interface, before its first
-poll. The loops number those cores, whatever `--threads` says. One unpinned thread per verb drains `/tool/batch`.
+poll. The loops number those cores, whatever `--threads` says. Those polling threads are the only ones serving: between
+polls each claims every `/tool/batch` endpoint without waiting and answers whatever batch is due.
 """
 
 import asyncio
@@ -35,6 +36,7 @@ UPSTREAM_HEADERS = ("content-type: application/json", "accept-encoding: identity
 # The longest one poll waits, as the binding's own `Server.run` slices it, and while uploads pull, the longest pause
 # the binding's `_until_final` takes between two looks at a pull, so the pull is seen once it finished.
 POLL_SLICE_MICROSECONDS, UPLOAD_SLICE_MICROSECONDS = 100_000, 1_000
+BATCH_WAIT_MICROSECONDS = round(args.batch_wait * 1e6)
 STOPPING = {signal.SIGINT, signal.SIGTERM}
 # Requests one connection may have in flight: RFC 9113's recommended minimum of concurrent streams, the depth tonic and
 # grpc.aio allow when they advertise no limit, so every stack's throughput test runs at one depth.
@@ -337,26 +339,39 @@ def batch(requests: list[ucall.Request]) -> None:
         tool(request)
 
 
-def drain(batches: ucall.BatchEndpoint) -> None:
-    signal.pthread_sigmask(signal.SIG_BLOCK, STOPPING)
-    batches.take_batches()
+def take_due_batches() -> None:
+    """Answers each batch endpoint's due batch unless another polling thread holds that endpoint now.
+
+    Every polling thread claims the endpoints in turn, so a batch fires on the first one to look once it is due: on the
+    thread whose deposit filled it, or for a partial batch on the first poll to end after its oldest request waited
+    `--batch-wait`. Polls wait at most `--batch-wait`, so that one ends within `--batch-wait` of the deadline.
+    """
+    for endpoint in batches:
+        try:
+            endpoint.take_batch()  # a zero timeout never sleeps: it claims, fires what is due, and releases
+        except ucall.Error as error:
+            if error.status != ucall.Status.CONTENDED:
+                raise
 
 
 async def serve(event_loop: int) -> None:
     """Polls `event_loop` until the server stops, between polls forwarding fan-outs and letting uploads pull."""
     signal.pthread_sigmask(signal.SIG_BLOCK, STOPPING)
     loop = loops[threading.get_ident()] = Loop(event_loop)
-    wait, take = POLL_SLICE_MICROSECONDS, server.take_call
+    poll_slice = min(POLL_SLICE_MICROSECONDS, BATCH_WAIT_MICROSECONDS)
+    upload_slice = min(UPLOAD_SLICE_MICROSECONDS, BATCH_WAIT_MICROSECONDS)
+    wait, take = poll_slice, server.take_call
     while take(event_loop, wait):
+        take_due_batches()
         if not (loop.waiting or loop.calls_in_flight or loop.uploads):
-            wait = POLL_SLICE_MICROSECONDS
+            wait = poll_slice
             continue  # Steady tool calls stay in C: one call per poll, no asyncio step.
         loop.forward()
         started = loop.pulls
         await asyncio.sleep(0)
         # A pull the loop answers from bytes it already holds finishes inside a poll without waking it, so the poll
         # after new pulls does not wait.
-        wait = 0 if loop.pulls != started else UPLOAD_SLICE_MICROSECONDS if loop.uploads else POLL_SLICE_MICROSECONDS
+        wait = 0 if loop.pulls != started else upload_slice if loop.uploads else poll_slice
 
 
 def poll_pinned(core: int, event_loop: int) -> None:
@@ -375,7 +390,6 @@ if __name__ == "__main__":
     server.add_endpoint("/fanout", "POST", fanout)
     server.add_endpoint("/stats", "GET", unit)
     server.add_endpoint("/health", "GET", health)
-    wait = round(args.batch_wait * 1e6)
     batches = [
         server.add_batch_endpoint(
             "/tool/batch",
@@ -383,7 +397,7 @@ if __name__ == "__main__":
             batch,
             min_size=args.batch_size,
             max_size=args.batch_size,
-            max_latency_microseconds=wait,
+            max_latency_microseconds=BATCH_WAIT_MICROSECONDS,
         )
         for verb in ("POST", "PUT")
     ]
@@ -394,7 +408,6 @@ if __name__ == "__main__":
         for memory_domain, cores in CORES_NEAR.items()
         for index, core in enumerate(cores)
     ]
-    pollers += [threading.Thread(target=drain, args=(endpoint,)) for endpoint in batches]
     for poller in pollers:
         poller.start()
     for interface, address, memory_domain in zip(args.interfaces, server.addresses, MEMORY_DOMAINS):

@@ -243,7 +243,8 @@ Servers
   --batch-size <N>                      32
       Most calls one batch gathers, passed explicitly because the frameworks' defaults differ widely.
   --batch-wait <DURATION>               10ms
-      Longest a batch waits to fill.
+      Longest a partial batch's oldest call waits before it fires. The UCall servers fire it on the next poll
+      after that, at most one poll slice later: the smaller of this wait and POLL_SLICE, 100 ms.
 
 Clients
   --targets <ADDRESSES>                 127.0.0.1

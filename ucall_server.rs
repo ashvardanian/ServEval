@@ -3,7 +3,8 @@
 //!
 //! UCall starts no threads, so this program places its own: one ForkUnion pool per memory domain that hosts an
 //! interface, pinned to the cores of the affinity mask local to that domain, each thread polling one loop. The loops
-//! number those cores, whatever `--threads` says. Each `/tool/batch` drain thread answers its batches itself.
+//! number those cores, whatever `--threads` says. Those polling threads are the only ones serving: between polls each
+//! claims every `/tool/batch` endpoint without waiting and answers whatever batch is due, so no thread waits on a batch.
 
 use std::{
     borrow::Cow,
@@ -20,16 +21,15 @@ use std::{
         OnceLock,
     },
     task::{Context, Waker},
-    thread,
     time::Duration,
 };
 
 use bytes::Bytes;
 use forkunion::{CallerExclusivity, ComputeDomain, ThreadPool, Topology};
 use ucall::{
-    Batch, Batching, BodyDelivery, BytesView, Client, ClientCall, ClientCallOptions, ClientOptions, Completed,
-    Deferred, DetachedRequest, EventLoopStatistics, HTTPStatus, Interface, NoiseKey, PeerAuthorizer, Polling,
-    ReplyPart, Request, Server, Status, Verb,
+    Batch, BatchEndpoint, Batching, BodyDelivery, BytesView, Client, ClientCall, ClientCallOptions, ClientOptions,
+    Completed, Deferred, DetachedRequest, EventLoopStatistics, HTTPStatus, Interface, NoiseKey, PeerAuthorizer,
+    Polling, ReplyPart, Request, Server, Status, Verb,
 };
 
 use serveval::{
@@ -45,7 +45,6 @@ const IDENTITY: &str = "accept-encoding: identity";
 const RANGE_NOT_SATISFIABLE: HTTPStatus = HTTPStatus(416);
 /// The longest one poll waits; an unbounded wait fails the loop with an I/O error on macOS's kqueue backend.
 const POLL_SLICE: Duration = Duration::from_millis(100);
-/// How long idle batch workers stay blocked before checking again, as UCall's `examples/inference/server.cpp:51` sets.
 /// Requests one connection may have in flight: RFC 9113's recommended minimum of concurrent streams, the depth tonic
 /// and grpc.aio allow when they advertise no limit, so every stack's throughput test runs at one depth.
 const MAX_PIPELINED_REQUESTS: usize = arguments::RFC_9113_MINIMUM_CONCURRENT_STREAMS;
@@ -155,11 +154,12 @@ impl DownloadSlots {
 static DOWNLOAD_BODY: OnceLock<Option<&'static [u8]>> = OnceLock::new();
 
 /// The counters of `statistics` a row prices per request, by their UCall names.
-fn counters(statistics: &EventLoopStatistics) -> [(&'static str, u64); 14] {
+fn counters(statistics: &EventLoopStatistics) -> [(&'static str, u64); 16] {
     [
         ("polls", statistics.polls),
         ("empty_polls", statistics.empty_polls),
         ("kernel_enters", statistics.kernel_enters),
+        ("kernel_entries", statistics.kernel_entries),
         ("submissions", statistics.submissions),
         ("completions", statistics.completions),
         ("requests", statistics.requests),
@@ -171,6 +171,7 @@ fn counters(statistics: &EventLoopStatistics) -> [(&'static str, u64); 14] {
         ("zero_copy_sends", statistics.zero_copy_sends),
         ("copying_sends", statistics.copying_sends),
         ("ready_passes", statistics.ready_passes),
+        ("replied_dequeues", statistics.replied_dequeues),
     ]
 }
 
@@ -367,9 +368,21 @@ impl Fanouts {
     }
 }
 
-/// Polls `event_loop` until the server stops, between polls handing the jobs its handlers queued to its bound client
-/// and its uploads; without upstreams there is no client, and no fan-out is queued.
-fn poll(server: &Server, event_loop: usize, mut client: Option<&mut Client>, upstreams: &Upstreams) {
+/// Polls `event_loop` until the server stops, between polls answering any due batch of the endpoints no other polling
+/// thread holds, then handing the jobs its handlers queued to its bound client and its uploads; without upstreams
+/// there is no client, and no fan-out is queued.
+///
+/// Every polling thread claims the batch endpoints in turn, so a batch fires on the first one to look once it is due:
+/// on the thread whose deposit filled it, or for a partial batch on the first poll to end after its oldest request
+/// waited `batch_wait`. Polls wait at most `batch_wait`, so that one ends within `batch_wait` of the deadline.
+fn poll(
+    server: &Server,
+    event_loop: usize,
+    mut client: Option<&mut Client>,
+    upstreams: &Upstreams,
+    batches: &[BatchEndpoint],
+    poll_slice: Duration,
+) {
     let mut fanouts = Fanouts::default();
     let mut uploads: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
     let mut completed: Vec<Completed> = (0..upstreams.connections).map(|_| Completed::default()).collect();
@@ -379,10 +392,19 @@ fn poll(server: &Server, event_loop: usize, mut client: Option<&mut Client>, ups
     loop {
         // A pull the loop answers from bytes it already holds finishes inside a poll without waking it, so the poll
         // after new pulls does not wait.
-        match server.take_call(event_loop, if pulled { Duration::ZERO } else { POLL_SLICE }) {
+        match server.take_call(event_loop, if pulled { Duration::ZERO } else { poll_slice }) {
             Ok(Polling::Serving) => {}
             Ok(Polling::Retired) => return,
             Err(error) => arguments::exit(&format!("event loop {event_loop} failed: {error}")),
+        }
+        for endpoint in batches {
+            // A zero timeout never sleeps: it claims the endpoint, fires what is due, and releases it.
+            match endpoint.take_batch(Duration::ZERO) {
+                Err(error) if error.status != Status::Contended => {
+                    arguments::exit(&format!("batch endpoint failed: {error}"))
+                }
+                _ => {} // answered what was due, or another polling thread holds the endpoint now
+            }
         }
         INBOX.with_borrow_mut(|inbox| {
             for job in inbox.drain(..) {
@@ -608,8 +630,8 @@ fn main() {
         })
         .collect();
     let topology = Topology::new().unwrap_or_else(|error| arguments::exit(&format!("ForkUnion topology: {error}")));
-    // The drain thread answers each batch itself: a tool reply costs a few microseconds, and waking a pool for
-    // 32 of them cost more than it saved (35-121 µs/call against 8 µs unbatched in the smoke phase).
+    // The polling thread that claims a due batch answers it itself: a tool reply costs a few microseconds, and waking
+    // a pool for 32 of them cost more than it saved (35-121 µs/call against 8 µs unbatched in the smoke phase).
     let batch = |batch: Batch| batch.into_iter().for_each(tool);
     let mut server = Server::new(&interfaces).unwrap_or_else(|error| arguments::exit(&format!("UCall: {error}")));
     if server.event_loops() != event_loops {
@@ -687,6 +709,7 @@ fn main() {
     );
 
     let server = &server;
+    let poll_slice = POLL_SLICE.min(args.batch_wait);
     serving.store(std::ptr::from_ref(server).cast_mut().cast(), Ordering::Release);
     let poll_loop = |event_loop: usize| {
         // The client is made on its polling thread, so its buffers land on that thread's memory domain.
@@ -701,20 +724,15 @@ fn main() {
             };
             Client::new(options).unwrap_or_else(|error| arguments::exit(&format!("UCall client: {error}")))
         });
-        poll(server, event_loop, client.as_mut(), &upstreams);
+        poll(server, event_loop, client.as_mut(), &upstreams, &batches, poll_slice);
     };
     let until_stopped = || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
         let runtime = runtime.unwrap_or_else(|error| arguments::exit(&format!("signals: {error}")));
         runtime.block_on(arguments::stop_signal());
-        server.stop(); // every `take_call` and `take_batches` returns, so every pool's threads finish
+        server.stop(); // every `take_call` returns, so every pool's threads finish
     };
-    thread::scope(|scope| {
-        for endpoint in &batches {
-            scope.spawn(|| endpoint.take_batches());
-        }
-        serve(&mut pollers, &poll_loop, &until_stopped);
-    });
+    serve(&mut pollers, &poll_loop, &until_stopped);
     // Per-loop and per-endpoint counters, so sends, completions and wakeups per request can be checked per row.
     for event_loop in 0..server.event_loops() {
         if let Ok(statistics) = server.event_loop_statistics(event_loop) {

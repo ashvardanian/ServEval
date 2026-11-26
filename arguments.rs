@@ -49,7 +49,8 @@ pub struct ServerArgs {
     /// Most calls one batch gathers, for frameworks that ship batching.
     #[arg(long, env = "SERVEVAL_BATCH_SIZE", default_value = "32", value_parser = parse_count_flag)]
     pub batch_size: usize,
-    /// Longest a batch waits to fill.
+    /// Longest a partial batch's oldest call waits before it fires. The UCall servers fire it on the next poll after
+    /// that, at most one poll slice later: the smaller of this wait and `POLL_SLICE`, 100 ms.
     #[arg(long, env = "SERVEVAL_BATCH_WAIT", default_value = "10ms", value_parser = parse_duration_flag)]
     pub batch_wait: Duration,
     #[command(flatten)]
