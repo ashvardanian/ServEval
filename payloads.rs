@@ -16,6 +16,13 @@ pub const RING: usize = 1024;
 pub const MESSAGE_TRACE_BYTES: usize = 888;
 /// `ToolReply.content` bytes that pad the protobuf reply without a trace id to `REPLY_BYTES`.
 pub const MESSAGE_CONTENT_BYTES: usize = 222;
+/// The largest message a gRPC receiver takes by default: gRPC core's `GRPC_DEFAULT_MAX_RECV_MESSAGE_LENGTH` and
+/// tonic's `DEFAULT_MAX_RECV_MESSAGE_SIZE`, both 4MB.
+pub const GRPC_DEFAULT_MAXIMUM_RECEIVE_MESSAGE_BYTES: usize = 4 << 20;
+/// Bytes of each `Chunk` a gRPC upload or download streams: the default receive limit less the `data` field's own
+/// framing, its one-byte tag and the four-byte varint its length takes from 2^21 up to 2^28, so each message is as
+/// large as every default receiver takes and a body crosses in as few messages as the protocol allows.
+pub const CHUNK_BYTES: usize = GRPC_DEFAULT_MAXIMUM_RECEIVE_MESSAGE_BYTES - 1 - 4;
 pub const JSON: &str = "application/json";
 pub const OCTETS: &str = "application/octet-stream";
 /// The tool every call names, in the body and in the `full` path.
@@ -23,6 +30,9 @@ pub const TOOL_NAME: &str = "search_documents";
 pub const LANG: &str = "en";
 /// The `authorization` header of every `full` call, which servers answer with 401 when it differs.
 pub const AUTHORIZATION: &str = "Bearer 6f1c09a4e2b7d35c81f0aa4e92d1c7b3";
+/// The metadata entry of a gRPC `Health` reply carrying `max_concurrent_streams_per_connection`, which `HealthReply`
+/// has no field for; a reply without it advertises no limit.
+pub const MAX_CONCURRENT_STREAMS_METADATA: &str = "max-concurrent-streams-per-connection";
 
 const GOLDEN_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 const QUERY_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz      ";
@@ -159,6 +169,47 @@ pub fn context_body(seed: u64, bytes: u64) -> Bytes {
     Bytes::from(body)
 }
 
+/// The path of a download of `bytes` bytes.
+pub fn download_path(bytes: u64) -> String {
+    format!("/context?bytes={bytes}")
+}
+
+/// The first `bytes` bytes of the prepared download body, `None` when it holds fewer.
+pub fn download(prepared: &Bytes, bytes: u64) -> Option<Bytes> {
+    let bytes = usize::try_from(bytes).ok().filter(|&bytes| bytes <= prepared.len())?;
+    Some(prepared.slice(..bytes))
+}
+
+/// Compares a download's reply chunk by chunk with the bytes it must equal, so a client checks the length and every
+/// byte without gathering the reply first.
+pub struct DownloadCheck<'expected> {
+    expected: &'expected [u8],
+    received: usize,
+    matching: bool,
+}
+
+impl<'expected> DownloadCheck<'expected> {
+    pub fn new(expected: &'expected [u8]) -> Self {
+        Self {
+            expected,
+            received: 0,
+            matching: true,
+        }
+    }
+
+    /// Compares the next `chunk` of the reply with the expected bytes at its offset.
+    pub fn chunk(&mut self, chunk: &[u8]) {
+        let rest = self.expected.get(self.received..).unwrap_or_default();
+        self.matching &= rest.starts_with(chunk);
+        self.received += chunk.len();
+    }
+
+    /// The bytes received when every one matched and none was missing, `None` otherwise.
+    pub fn matched(&self) -> Option<u64> {
+        (self.matching && self.received == self.expected.len()).then_some(self.received as u64)
+    }
+}
+
 /// One HTTP tool or fan-out call as a client sends it, and the reply it must get back byte for byte.
 pub struct Exchange {
     pub path: String,
@@ -248,6 +299,12 @@ pub struct FullCall {
     pub trace: String,
 }
 
+/// The query of a download, `GET /context?bytes=N`.
+#[derive(serde::Deserialize)]
+pub struct DownloadQuery {
+    pub bytes: u64,
+}
+
 /// The query of a `full` call.
 #[derive(serde::Deserialize)]
 pub struct FullQuery {
@@ -298,9 +355,29 @@ pub fn count_reply(bytes: u64) -> String {
     format!("{bytes:016x}")
 }
 
-/// The `/health` body naming the pair and whether the server batches.
-pub fn health(framework: &str, client: &str, batching: bool) -> String {
-    format!(r#"{{"framework":"{framework}","client":"{client}","batching":{batching}}}"#)
+/// The `/health` body naming the pair, whether the server batches and its `--batch-size`, null when it does not. Its
+/// `max_concurrent_streams_per_connection`, the `SETTINGS_MAX_CONCURRENT_STREAMS` a server advertises, is null: its
+/// clients drive every Rust server answering in JSON over HTTP/1.1, and tonic answers `Health` in protobuf, under
+/// `MAX_CONCURRENT_STREAMS_METADATA`.
+pub fn health(framework: &str, client: &str, batch_size: Option<usize>) -> String {
+    let batching = batch_size.is_some();
+    let batch_size = batch_size.map_or_else(|| "null".to_owned(), |size| size.to_string());
+    format!(
+        r#"{{"framework":"{framework}","client":"{client}","batching":{batching},"batch_size":{batch_size},"max_concurrent_streams_per_connection":null}}"#
+    )
+}
+
+/// `health` for a server that pipelines HTTP/1.1 requests, adding the `max_pipelined_requests_per_connection` one
+/// connection may have in flight, which a client's `server-maximum` reads before the stream limit.
+pub fn pipelined_health(
+    framework: &str,
+    client: &str,
+    batch_size: Option<usize>,
+    max_pipelined_requests_per_connection: usize,
+) -> String {
+    let mut body = health(framework, client, batch_size);
+    body.pop(); // the closing brace
+    format!("{body},\"max_pipelined_requests_per_connection\":{max_pipelined_requests_per_connection}}}")
 }
 
 #[cfg(feature = "tonic")]
@@ -384,5 +461,16 @@ mod tests {
         assert_eq!(bodies[0].len(), TOOL_BYTES + REPLY_BYTES);
         assert_eq!(first.full_body().len(), TOOL_BYTES);
         assert_eq!(trace_id(first.traceparent().as_bytes()), Some(first.trace_id()));
+    }
+
+    #[test]
+    #[cfg(feature = "tonic")]
+    fn chunk_fills_the_default_receive_limit() {
+        use prost::Message;
+
+        let chunk = crate::proto::Chunk {
+            data: Bytes::from(vec![0; CHUNK_BYTES]),
+        };
+        assert_eq!(chunk.encoded_len(), GRPC_DEFAULT_MAXIMUM_RECEIVE_MESSAGE_BYTES);
     }
 }

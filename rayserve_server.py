@@ -1,4 +1,5 @@
-"""Ray Serve with a FastAPI ingress serving the tool, context and fan-out workloads, batching through serve.batch.
+"""Ray Serve with a FastAPI ingress serving the tool, context, download and fan-out workloads, batching through
+serve.batch.
 
 Ray's proxy binds by address alone, so it cannot pin a device; --threads sets the replicas.
 """
@@ -123,6 +124,18 @@ class Agent:
             count += len(chunk)
         return Response(payloads.count_reply(count), media_type="text/plain")
 
+    @app.get("/context")
+    async def download(self, bytes: int) -> Response:
+        """The first `bytes` bytes of the body each replica prepares on its first download; 416 when it prepared
+        fewer, 500 when it could not prepare any."""
+        prepared = arguments.download_body(args)
+        if prepared is None:
+            return Response(status_code=500)
+        body = payloads.download(prepared, bytes)
+        if body is None:
+            return Response(status_code=416)
+        return Response(body, media_type="application/octet-stream")
+
     @app.post("/fanout")
     async def fanout(self, request: Request, width: int) -> Response:
         body = await request.body()
@@ -145,7 +158,7 @@ class Agent:
 
     @app.get("/health")
     async def health(self) -> Response:
-        return Response(payloads.health("rayserve", "httpx", True), media_type="application/json")
+        return Response(payloads.health("rayserve", "httpx", args.batch_size), media_type="application/json")
 
 
 if __name__ == "__main__":

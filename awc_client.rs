@@ -1,17 +1,22 @@
 //! awc on one actix system per thread, each with a pooled client per target sized to its share of the connections
-//! and filled up front by concurrent health checks; awc binds a local address but cannot bind a device.
+//! and filled up front by concurrent health checks, over sockets `arguments::connect` opens from the paired interface;
+//! awc cannot bind a device.
 //! The threads live across configurations, so their pools can stay open under `--between-runs keep`.
 
 use std::{
     io,
-    sync::{mpsc, Arc, Barrier},
+    net::{IpAddr, SocketAddr},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Barrier,
+    },
     thread,
     time::Duration,
 };
 
-use actix_tls::connect::{ConnectError as TcpConnectError, ConnectInfo, ConnectorService};
+use actix_tls::connect::{ConnectError as TcpConnectError, ConnectInfo, Connection as TcpConnection};
 use actix_web::{
-    dev::{fn_service, Service},
+    dev::fn_service,
     http::{
         header::{self, ContentType},
         StatusCode, Uri,
@@ -20,7 +25,7 @@ use actix_web::{
 };
 use awc::error::{ConnectError, SendRequestError};
 use bytes::Bytes;
-use futures::future::join_all;
+use futures::{future::join_all, StreamExt};
 use rustls::ClientConfig;
 
 use serveval::{
@@ -28,10 +33,10 @@ use serveval::{
     payloads::{self, Exchange, ToolParts},
     results::{Pair, Report, Sample},
     security,
-    stats::{self, Failure, Slot, Tally, UnitStats, Window},
+    stats::{self, Failure, ServerStats, Slot, Tally, UnitStats, Window},
 };
 
-/// awc driving an HTTP server through the tool, context and fan-out workloads.
+/// awc driving an HTTP server through the tool, context, download and fan-out workloads.
 #[derive(clap::Parser)]
 #[command(about)]
 struct Cli {
@@ -47,30 +52,43 @@ struct Shared {
     ring: Vec<ToolParts>,
 }
 
-/// One configuration's calls: the context upload, or one exchange per ring entry.
+/// One configuration's calls: the context upload or download, or one exchange per ring entry.
 struct Load {
     shared: Arc<Shared>,
     run: Run,
     exchanges: Vec<Exchange>,
     /// Each target's URL per exchange, or its one context URL.
     urls: Vec<Vec<String>>,
+    /// The body a context upload sends, or a download must get back.
     context: Bytes,
 }
 
 fn client(shared: &Shared, target: usize, limit: usize) -> awc::Client {
-    // awc's own TCP connector leaves Nagle's algorithm on.
-    let tcp = ConnectorService::default();
-    let nodelay = fn_service(move |info: ConnectInfo<Uri>| {
-        let connecting = tcp.call(info);
+    // awc's own TCP connector binds its local address with port 0, which claims an ephemeral port before the target is
+    // known, so a run of 65,536 connections exhausts them; it also leaves Nagle's algorithm on. `arguments::connect`
+    // binds with `IP_BIND_ADDRESS_NO_PORT`, letting `connect` pick a port per target, and turns Nagle's algorithm off,
+    // as for hyper and tonic, each connection taking the interface's addresses in turn.
+    let interface = shared.args.interface_of(target).clone();
+    let opened = Arc::new(AtomicUsize::new(0));
+    let bound = fn_service(move |info: ConnectInfo<Uri>| {
+        let (interface, index) = (interface.clone(), opened.fetch_add(1, Ordering::Relaxed));
         async move {
-            let connection = connecting.await?;
-            connection.io_ref().set_nodelay(true).map_err(TcpConnectError::Io)?;
-            Ok::<_, TcpConnectError>(connection)
+            // The origins name targets by address, so no resolver runs; a bracketed IPv6 host loses its brackets.
+            let host = info.hostname().trim_start_matches('[').trim_end_matches(']');
+            let address = info.addrs().next().or_else(|| {
+                let address: IpAddr = host.parse().ok()?;
+                Some(SocketAddr::new(address, info.port()))
+            });
+            let address = address.ok_or(TcpConnectError::Unresolved)?;
+            let stream = arguments::connect(&interface, index, address)
+                .await
+                .map_err(TcpConnectError::Io)?;
+            Ok::<_, TcpConnectError>(TcpConnection::new(info.request().clone(), stream))
         }
     });
     // awc's default 15s idle and 75s lifetime would recycle pooled connections inside a measured window.
     let connector = awc::Connector::new()
-        .connector(nodelay)
+        .connector(bound)
         .limit(limit)
         .conn_keep_alive(Duration::MAX)
         .conn_lifetime(Duration::MAX)
@@ -79,7 +97,6 @@ fn client(shared: &Shared, target: usize, limit: usize) -> awc::Client {
         .connector(connector)
         .disable_timeout()
         .no_default_headers()
-        .local_address(shared.args.interface_of(target).addresses[0])
         .finish()
 }
 
@@ -95,12 +112,13 @@ fn failure(error: &SendRequestError) -> Failure {
 fn request(load: &Load, client: &awc::Client, target: usize, sequence: usize) -> (awc::ClientRequest, Bytes, Bytes) {
     let urls = &load.urls[target];
     let url = &urls[sequence % urls.len()];
-    let (request, body, reply) = match load.exchanges.get(sequence % payloads::RING) {
-        None => {
+    let (request, body, reply) = match (load.run.workload, load.exchanges.get(sequence % payloads::RING)) {
+        (Workload::Download, _) => (client.get(url), Bytes::new(), load.context.clone()),
+        (_, None) => {
             let reply = payloads::count_reply(load.context.len() as u64);
             (client.put(url), load.context.clone(), Bytes::from(reply))
         }
-        Some(exchange) => {
+        (_, Some(exchange)) => {
             let mut request = client.post(url);
             if let Some(traceparent) = &exchange.traceparent {
                 request = request
@@ -119,9 +137,25 @@ fn request(load: &Load, client: &awc::Client, target: usize, sequence: usize) ->
     (request, body, reply)
 }
 
+/// Sends a download and compares its reply chunk by chunk with `expected`, returning the bytes received.
+async fn download(request: awc::ClientRequest, expected: &[u8]) -> Result<u64, Failure> {
+    let mut response = request.send().await.map_err(|error| failure(&error))?;
+    if response.status() != StatusCode::OK {
+        return Err(Failure::Status);
+    }
+    let mut check = payloads::DownloadCheck::new(expected);
+    while let Some(chunk) = response.next().await {
+        check.chunk(&chunk.map_err(|_| Failure::Connect)?);
+    }
+    check.matched().ok_or(Failure::WrongReply)
+}
+
 /// One verified call: the body bytes sent and received, or why it failed.
 async fn call(load: &Load, client: &awc::Client, target: usize, sequence: usize) -> Result<(u64, u64), Failure> {
     let (request, body, expected) = request(load, client, target, sequence);
+    if load.run.workload == Workload::Download {
+        return Ok((0, download(request, &expected).await?));
+    }
     let sent = body.len() as u64;
     let mut response = request.send_body(body).await.map_err(|error| failure(&error))?;
     let status = response.status();
@@ -148,7 +182,7 @@ fn get(shared: &Shared, target: usize, path: &str) -> Option<Bytes> {
     })
 }
 
-fn server_stats(shared: &Shared) -> UnitStats {
+fn server_stats(shared: &Shared) -> ServerStats {
     let all: Vec<UnitStats> = (0..shared.origins.len())
         .map(|target| {
             get(shared, target, "/stats")
@@ -259,8 +293,12 @@ fn main() -> io::Result<()> {
     let args = &shared.args;
     let threads = args.common.threads.0.get();
     let health = get(&shared, 0, "/health").ok_or_else(|| io::Error::other("no /health reply"))?;
-    let pair: Pair = serde_json::from_slice(&health)?;
-    let runs = args.runs(pair.batching, false);
+    // The row names this client, not the one `/health` names for the server's own pair.
+    let pair = Pair {
+        client: "awc".into(),
+        ..serde_json::from_slice(&health)?
+    };
+    let runs = args.runs(pair.batching, false, pair.max_concurrent_streams_per_connection);
     let mut report = Report::new(args, pair);
     let (ready, readied) = mpsc::channel();
     let (finished, tallies) = mpsc::channel();
@@ -284,15 +322,21 @@ fn main() -> io::Result<()> {
         .unzip();
     drop((ready, finished));
     for (number, run) in runs.into_iter().enumerate() {
+        if let Some(reason) = run.unsupported {
+            report.unsupported(args, &run, reason)?;
+            continue;
+        }
         let (context, exchanges) = match run.workload {
-            Workload::Context => (
+            Workload::Context | Workload::Download => (
                 payloads::context_body(args.common.seed.into(), run.body_bytes),
                 Vec::new(),
             ),
             _ => (Bytes::new(), payloads::exchanges(&shared.ring, &run, args.width)),
         };
+        let download_path = payloads::download_path(run.body_bytes);
         let paths: Vec<&str> = match run.workload {
             Workload::Context => vec!["/context"],
+            Workload::Download => vec![download_path.as_str()],
             _ => exchanges.iter().map(|exchange| exchange.path.as_str()).collect(),
         };
         let urls = shared
@@ -309,7 +353,7 @@ fn main() -> io::Result<()> {
         });
         if let Some(StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED) = probe(&load)
         {
-            report.unsupported(&run);
+            report.unsupported(args, &run, arguments::NOT_SERVED)?;
             continue;
         }
         let server_before = server_stats(&shared);
@@ -342,10 +386,10 @@ fn main() -> io::Result<()> {
         };
         report.add(args, &run, &window, &tally, &sample)?;
         if args.between_runs == BetweenRuns::Reconnect {
-            let mut earlier = (stats::sockets_in_use(), server_stats(&shared).memory_bytes);
+            let mut earlier = (stats::sockets_in_use(), server_stats(&shared).memory_current_bytes);
             for _ in 0..stats::SETTLE_ROUNDS {
                 thread::sleep(stats::SETTLE_INTERVAL);
-                let later = (stats::sockets_in_use(), server_stats(&shared).memory_bytes);
+                let later = (stats::sockets_in_use(), server_stats(&shared).memory_current_bytes);
                 if stats::settled(earlier, later) {
                     break;
                 }

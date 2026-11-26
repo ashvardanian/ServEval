@@ -4,11 +4,22 @@ The threads live across configurations, so their clients can stay open under `--
 share of the connections up front by concurrent health checks, then drives its slots on the schedule `stats.slot_loop`
 keeps, waiting on the network exactly until the next call is due. UCall's client binds neither a device nor an address,
 so the kernel routes each target by its subnet.
+
+Each thread unpickles its own copy of the calls, their options and the window. On free-threaded CPython an object
+another thread made takes atomic reference counts, and a dictionary another thread reads takes its lock, so objects
+every thread touched on every call would cap the client, not the server.
+
+UCall pipelines only idempotent calls, per RFC 9112 section 9.3.2, so a run keeping several calls in flight per
+connection sends its tool calls as PUT, which the UCall servers answer as they answer POST; context uploads already are.
+A fan-out's POST is not idempotent, so its deeper runs, and handshake runs, whose calls close their connection, are
+`unsupported`.
 """
 
+import dataclasses
 import heapq
 import json
 import pathlib
+import pickle
 import queue
 import threading
 import time
@@ -29,6 +40,11 @@ IDENTITY, CLOSE = "accept-encoding: identity", "connection: close"
 UNSUPPORTED = (404, 405, 501)
 # UCall's default call budget, which bounds every wait for a completion.
 CALL_TIMEOUT_MICROSECONDS = 30_000_000
+# Why a fan-out run keeping several calls in flight per connection cannot run.
+FANOUT_NOT_IDEMPOTENT = "fan-out calls are not idempotent"
+# Why a handshake run keeping several calls in flight per connection cannot run: UCall pipelines no call behind one
+# that closes its connection.
+HANDSHAKE_CLOSES = "handshake calls close their connection"
 
 
 def read_key(name: str) -> bytes:
@@ -52,16 +68,24 @@ origins = [
     for target in args.targets
 ]
 ring = payloads.tool_ring(args.seed)
-contexts = (
-    {size: payloads.context_body(args.seed, size) for size in args.body_bytes} if "context" in args.workloads else {}
-)
+# The body each upload sends and each download must get back, per size.
+bodies = {"context", "download"} & set(args.workloads)
+contexts = {size: payloads.context_body(args.seed, size) for size in arguments.body_bytes(args)} if bodies else {}
 options = {"security": security, "noise_peer_key": server_public}
 
 
-def open_client(connections: int) -> ucall.Client:
-    """A client of `connections` connections, admitting the servers' key under Noise XX."""
+def open_client(connections: int, depth: int = 1, calls: int = 0) -> ucall.Client:
+    """A client of `connections` connections, each pipelining up to `depth` of the `calls` it accepts at once,
+    admitting the servers' key under Noise XX."""
     authorize = (lambda key: key == server_public) if noise else None
-    return ucall.Client(connections=connections, noise_private_key=client_key, peer_authorizer=authorize)
+    return ucall.Client(
+        connections=connections,
+        pipelined_calls=depth,
+        calls=calls,
+        noise_private_key=client_key,
+        peer_authorizer=authorize,
+        max_response_bytes=max_response_bytes,
+    )
 
 
 class Exchange:
@@ -72,20 +96,24 @@ class Exchange:
 
 
 def exchanges_of(run: arguments.Run) -> list[list[Exchange]]:
-    """Per target, one exchange per ring entry, or the one context upload."""
+    """Per target, one exchange per ring entry, or the one context upload or download."""
     closing = (CLOSE,) if run.phase == "handshake" else ()
     if run.workload == "context":
         body = contexts[run.body_bytes]
         reply = payloads.count_reply(len(body))
         return [[Exchange("PUT", f"{origin}/context", body, HEADERS + closing, reply)] for origin in origins]
+    if run.workload == "download":
+        path, reply = payloads.download_path(run.body_bytes), contexts[run.body_bytes]
+        return [[Exchange("GET", origin + path, b"", HEADERS + closing, reply)] for origin in origins]
     calls = payloads.exchanges(ring, run, args.width)
+    verb = "POST" if run.calls_in_flight_per_connection == 1 else "PUT"  # only idempotent calls pipeline
 
     def headers_of(call: payloads.Exchange) -> tuple[str, ...]:
         traced = (f"authorization: {payloads.AUTHORIZATION}", f"traceparent: {call.traceparent}")
         return HEADERS + (traced if call.traceparent else ()) + closing
 
     return [
-        [Exchange("POST", origin + call.path, call.body, headers_of(call), call.reply) for call in calls]
+        [Exchange(verb, origin + call.path, call.body, headers_of(call), call.reply) for call in calls]
         for origin in origins
     ]
 
@@ -95,18 +123,39 @@ def get(control: ucall.Client, target: int, path: str) -> ucall.Response:
 
 
 def server_stats(control: ucall.Client) -> dict:
-    """The servers' cgroup counters, summed over the targets, and the largest box-wide `tcp_active_opens`."""
-    replies = [json.loads(bytes(get(control, target, "/stats").body)) for target in range(len(origins))]
-
-    def total(key: str):
-        values = [reply[key] for reply in replies]
-        return None if None in values else max(values) if key == "tcp_active_opens" else sum(values)
-
-    return {key: total(key) for key in replies[0]}
+    """The servers' `/stats` replies as one server's, as `stats.server_stats` sums them."""
+    # A server too busy to answer its control call within the timeout leaves this sample empty, as the httpx client's
+    # does, instead of ending the client while its workers still run.
+    replies = []
+    for target in range(len(origins)):
+        try:
+            replies.append(json.loads(bytes(get(control, target, "/stats").body)))
+        except ucall.Error:
+            replies.append({})
+    return stats.server_stats(replies)
 
 
 def record(bins: list[int], seconds: float) -> None:
     bins[min(stats.bin_of(max(int(seconds * 1e9), 0)), stats.BINS - 1)] += 1
+
+
+# RFC 9112's status line of a 200 reply, with RFC 9110's reason phrase, as UCall's servers write it.
+STATUS_LINE_OK = "HTTP/1.1 200 OK\r\n"
+# The largest reply a call buffers when downloads are swept, set once from the servers' own reply; 0 is UCall's default.
+max_response_bytes = 0
+
+
+def largest_reply_bytes(control: ucall.Client, largest: int) -> int | None:
+    """The largest download and the head of the servers' reply to it, as RFC 9112 frames it: the status line, every
+    `name: value` field line and the empty line. One streamed download of that size is pulled and dropped, so every
+    buffered download fits; None when the server does not answer it with 200. It sends a steady call's headers, whose
+    reply's `connection: keep-alive` is the longer of the two forms."""
+    url = origins[0] + payloads.download_path(largest)
+    response = control.get(url, headers=HEADERS, body_delivery=ucall.BodyDelivery.STREAMED, **options)
+    fields = sum(len(name) + len(b": ") + len(value) + len(b"\r\n") for name, value in response.fields())
+    for _ in response.body_chunks():
+        pass  # its connection carries nothing else until the body is pulled
+    return largest + len(STATUS_LINE_OK) + fields + len("\r\n") if response.status_code == 200 else None
 
 
 def outcome_of(completed: ucall.Completed, exchange: Exchange) -> tuple[int, int] | str:
@@ -119,7 +168,9 @@ def outcome_of(completed: ucall.Completed, exchange: Exchange) -> tuple[int, int
     return (len(exchange.body), len(exchange.reply)) if response.body == exchange.reply else "wrong_reply"
 
 
-def measure(client: ucall.Client, exchanges: list[list[Exchange]], window: stats.Window, index: int, threads: int):
+def measure(
+    client: ucall.Client, exchanges: list[list[Exchange]], options: dict, window: stats.Window, index: int, threads: int
+):
     """Runs slots `index + i * threads` of the window, slot `i` on target `i % targets`, each with one call
     outstanding, as `stats.slot_loop` schedules them."""
     tally, rate = stats.Tally(), window.calls_per_second
@@ -165,7 +216,8 @@ def measure(client: ucall.Client, exchanges: list[list[Exchange]], window: stats
             flights[position] = (intended, sequence)
             exchange = exchange_of(position, sequence)
             try:
-                client.submit(exchange.verb, exchange.url, exchange.body, exchange.headers, context=position, **options)
+                client.submit(exchange.verb, exchange.url, exchange.body, exchange.headers, context=position,
+                              **options)  # fmt: skip
                 outstanding += 1
             except ucall.Error as error:
                 finish(position, "timeout" if error.status == ucall.Status.TIMEOUT else "connect")
@@ -184,13 +236,16 @@ def measure(client: ucall.Client, exchanges: list[list[Exchange]], window: stats
 def work(index: int, threads: int, inbox: queue.SimpleQueue, outbox: queue.SimpleQueue, sampled) -> None:
     """One thread's client across configurations: it opens its share of the connections, reports ready, runs the
     window it then receives, reports its tally, and keeps its connections open until the servers were sampled."""
-    kept, limit = None, 0
+    kept, limit = None, None
     while (load := inbox.get()) is not None:
-        run, exchanges = load
+        run, exchanges, options = pickle.loads(load)
         connections = max(arguments.share(run.connections, index, threads), 1)
-        if kept is None or limit != connections:
+        depth = run.calls_in_flight_per_connection
+        # The slots this thread drives, which may exceed its connections' depth by the remainders of the two splits.
+        budget = (connections, depth, max(arguments.share(run.in_flight, index, threads), connections * depth))
+        if kept is None or limit != budget:
             kept = None
-            kept, limit = open_client(connections), connections
+            kept, limit = open_client(*budget), budget
         if run.phase == "steady":
             for target, origin in enumerate(origins):
                 for _ in range(arguments.share(connections, target, len(origins))):
@@ -199,8 +254,8 @@ def work(index: int, threads: int, inbox: queue.SimpleQueue, outbox: queue.Simpl
             while answered < connections:
                 answered += len(kept.take_completed(CALL_TIMEOUT_MICROSECONDS, connections))
         outbox.put(None)
-        window = inbox.get()
-        outbox.put(measure(kept, exchanges, window, index, threads))
+        window = pickle.loads(inbox.get())
+        outbox.put(measure(kept, exchanges, options, window, index, threads))
         sampled.wait()
         if args.between_runs == "reconnect":
             kept = None
@@ -209,7 +264,11 @@ def work(index: int, threads: int, inbox: queue.SimpleQueue, outbox: queue.Simpl
 if __name__ == "__main__":
     control = open_client(len(origins))
     health = json.loads(bytes(get(control, 0, "/health").body))
-    report = results.Report(args, health["framework"], health["client"])
+    # The row names this client, not the one `/health` names for the server's own pair.
+    report = results.Report(args, health["framework"], "ucall", health.get("batch_size"))
+    if "download" in args.workloads:
+        max_response_bytes = largest_reply_bytes(control, max(arguments.body_bytes(args))) or 0
+        control = open_client(len(origins))
     threads = args.threads
     sampled = threading.Barrier(threads + 1)
     inboxes, outbox = [queue.SimpleQueue() for _ in range(threads)], queue.SimpleQueue()
@@ -219,24 +278,40 @@ if __name__ == "__main__":
     ]
     for worker in workers:
         worker.start()
-    for position, run in enumerate(arguments.runs(args, health["batching"], multiplexed=False)):
+    # `server-maximum` is the server's pipelining depth, or, from a server that reports none, its stream limit.
+    advertised = health.get("max_pipelined_requests_per_connection")
+    if advertised is None:
+        advertised = health.get("max_concurrent_streams_per_connection")
+    for position, run in enumerate(arguments.runs(args, health["batching"], True, advertised)):
+        if run.calls_in_flight_per_connection > 1 and run.workload == "fanout":
+            run = dataclasses.replace(run, unsupported=FANOUT_NOT_IDEMPOTENT)
+        elif run.calls_in_flight_per_connection > 1 and run.phase == "handshake":
+            run = dataclasses.replace(run, unsupported=HANDSHAKE_CLOSES)
+        if run.unsupported:
+            report.unsupported(run, run.unsupported)
+            continue
         exchanges = exchanges_of(run)
         probe = exchanges[0][0]
-        status = control.request(probe.verb, probe.url, probe.body, headers=probe.headers, **options).status_code
+        try:
+            status = control.request(probe.verb, probe.url, probe.body, headers=probe.headers, **options).status_code
+        except ucall.Error:
+            status = None  # a failed probe is no missing route, so the run measures the failure
         if status in UNSUPPORTED:
-            report.unsupported(run)
+            report.unsupported(run, arguments.NOT_SERVED)
             continue
         server_before, client_before = server_stats(control), stats.process_cpu()
+        load = pickle.dumps((run, exchanges, options))
         for inbox in inboxes:
-            inbox.put((run, exchanges))
+            inbox.put(load)
         for _ in workers:
             outbox.get()
         window = stats.Window.starting(
             arguments.start_at(position), args.warmup, args.time_limit, args.calls_per_second, run.in_flight
         )
         opens_before = stats.tcp_active_opens()
+        load = pickle.dumps(window)
         for inbox in inboxes:
-            inbox.put(window)
+            inbox.put(load)
         tally = stats.Tally()
         for _ in workers:
             tally.merge(outbox.get())
@@ -250,10 +325,10 @@ if __name__ == "__main__":
         }
         report.add(run, window, tally, sample)
         if args.between_runs == "reconnect":
-            earlier = (stats.sockets_in_use(), server_stats(control)["memory_bytes"])
+            earlier = (stats.sockets_in_use(), server_stats(control)["memory_current_bytes"])
             for _ in range(stats.SETTLE_ROUNDS):
                 time.sleep(stats.SETTLE_INTERVAL_SECONDS)
-                later = (stats.sockets_in_use(), server_stats(control)["memory_bytes"])
+                later = (stats.sockets_in_use(), server_stats(control)["memory_current_bytes"])
                 if stats.settled(earlier, later):
                     break
                 earlier = later

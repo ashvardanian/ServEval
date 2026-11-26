@@ -1,14 +1,19 @@
 """httpx driving FastAPI, LitServe and Ray Serve, one asyncio loop in each of --threads processes.
 
-The framework and its batching come from the server's /health. httpx binds a local address but no device.
+The framework and its batching come from the server's /health. httpx binds a local address but no device, through a
+network backend that defers the source port to `connect`.
 The processes live across configurations, so their pools can stay open under `--between-runs keep`.
 """
 
 import asyncio
 import multiprocessing
+import socket
 import time
 
+import anyio
+import httpcore
 import httpx
+from httpcore._backends.anyio import AnyIOStream
 
 import arguments
 import payloads
@@ -25,11 +30,42 @@ bases = [
     for target in args.targets
 ]
 ring = payloads.tool_ring(args.seed)
-contexts = (
-    {size: payloads.context_body(args.seed, size) for size in args.body_bytes} if "context" in args.workloads else {}
-)
+# The body each upload sends and each download must get back, per size.
+bodies = {"context", "download"} & set(args.workloads)
+contexts = {size: payloads.context_body(args.seed, size) for size in arguments.body_bytes(args)} if bodies else {}
 timeout = args.warmup + args.time_limit
 UNSUPPORTED = (404, 405, 501)
+
+
+class BoundBackend(httpcore.AnyIOBackend):
+    """httpcore's AnyIO backend, binding each socket to its local address with `IP_BIND_ADDRESS_NO_PORT` before it
+    connects, as `arguments.rs` does for hyper and tonic. A plain `bind(address, 0)` claims an ephemeral port before
+    the target is known, so 65,536 connections per run exhaust them; deferred, `connect` picks a port per target.
+    httpcore applies its `socket_options` only after connecting, too late for this option, so the backend opens the
+    socket itself."""
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        opened = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            opened.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            for option in socket_options or ():
+                opened.setsockopt(*option)
+            if local_address is not None:
+                if hasattr(socket, "IP_BIND_ADDRESS_NO_PORT"):
+                    opened.setsockopt(socket.IPPROTO_IP, socket.IP_BIND_ADDRESS_NO_PORT, 1)
+                opened.bind((local_address, 0))
+            opened.setblocking(False)
+            with anyio.fail_after(timeout):
+                await asyncio.get_running_loop().sock_connect(opened, (host, port))
+            stream = await anyio.abc.SocketStream.from_socket(opened)
+        except TimeoutError as error:
+            opened.close()
+            raise httpcore.ConnectTimeout(str(error)) from error
+        except OSError as error:
+            opened.close()
+            raise httpcore.ConnectError(str(error)) from error
+        # httpcore's own stream over an AnyIO socket stream, so reads, writes and TLS behave as with its backend.
+        return AnyIOStream(stream)
 
 
 def client(target: int, connections: int, tls) -> httpx.AsyncClient:
@@ -38,6 +74,8 @@ def client(target: int, connections: int, tls) -> httpx.AsyncClient:
     local = arguments.interface_of(args, target).addresses[0]
     limits = httpx.Limits(max_connections=connections, max_keepalive_connections=connections)
     transport = httpx.AsyncHTTPTransport(local_address=local, verify=tls or True, limits=limits)
+    # httpx takes no network backend, and its pool hands the one it holds to every connection it opens.
+    transport._pool._network_backend = BoundBackend()
     opened = httpx.AsyncClient(transport=transport, base_url=bases[target], timeout=timeout, headers=payloads.HEADERS)
     for name in ("accept", "connection", "user-agent"):
         del opened.headers[name]
@@ -51,6 +89,8 @@ def request(
     if run.workload == "context":
         body = contexts[run.body_bytes]
         return "PUT", "/context", body, {}, payloads.count_reply(len(body))
+    if run.workload == "download":
+        return "GET", payloads.download_path(run.body_bytes), b"", {}, contexts[run.body_bytes]
     exchange = exchanges[sequence % payloads.RING]
     headers = {}
     if exchange.traceparent:
@@ -59,7 +99,7 @@ def request(
 
 
 def exchanges_of(run: arguments.Run) -> list[payloads.Exchange]:
-    return [] if run.workload == "context" else payloads.exchanges(ring, run, args.width)
+    return [] if run.workload in ("context", "download") else payloads.exchanges(ring, run, args.width)
 
 
 async def measure(run: arguments.Run, index: int, processes: int, tls, clients: list[httpx.AsyncClient]):
@@ -125,7 +165,8 @@ async def drive(index: int, processes: int, inbox, outbox) -> None:
             clients, limits = [client(target, limit, tls) for target, limit in enumerate(wanted)], wanted
         if run.phase == "steady":
             for pooled, limit in zip(clients, limits):
-                await asyncio.gather(*(pooled.get("/health") for _ in range(limit)))
+                # A server too loaded to answer the warm-up still gets measured: its slots count the failures.
+                await asyncio.gather(*(pooled.get("/health") for _ in range(limit)), return_exceptions=True)
         tally, suite, sampled = await measure(run, index, processes, tls, clients)
         if args.between_runs == "reconnect":
             for pooled in clients:
@@ -139,14 +180,16 @@ def work(index: int, processes: int, inbox, outbox) -> None:
 
 
 def server_stats(tls) -> dict:
-    """The servers' cgroup counters, summed over the targets, and the largest box-wide `tcp_active_opens`."""
-    replies = [httpx.get(f"{base}/stats", headers=payloads.HEADERS, verify=tls or True).json() for base in bases]
+    """The servers' `/stats` replies as one server's, as `stats.server_stats` sums them."""
+    return stats.server_stats([unit_stats(base, tls) for base in bases])
 
-    def total(key: str):
-        values = [reply[key] for reply in replies]
-        return None if None in values else max(values) if key == "tcp_active_opens" else sum(values)
 
-    return {key: total(key) for key in replies[0]}
+def unit_stats(base: str, tls) -> dict:
+    """One target's `/stats`, or no counters when an overloaded server cannot answer, so its row reads unknown."""
+    try:
+        return httpx.get(f"{base}/stats", headers=payloads.HEADERS, verify=tls or True).json()
+    except httpx.HTTPError:
+        return {}
 
 
 def probe(run: arguments.Run, tls) -> int:
@@ -160,7 +203,8 @@ if __name__ == "__main__":
     tls = security.client_context(args, ["http/1.1"])
     healths = [httpx.get(f"{base}/health", headers=payloads.HEADERS, verify=tls or True).json() for base in bases]
     framework, batching = healths[0]["framework"], all(health["batching"] for health in healths)
-    report = results.Report(args, framework, "httpx")
+    advertised = healths[0].get("max_concurrent_streams_per_connection")
+    report = results.Report(args, framework, "httpx", healths[0].get("batch_size"))
     processes = args.threads
     forking = multiprocessing.get_context("fork")
     begin, number = forking.Value("d"), forking.Value("q")
@@ -173,9 +217,12 @@ if __name__ == "__main__":
     ]
     for worker in workers:
         worker.start()
-    for position, run in enumerate(arguments.runs(args, batching, multiplexed=False)):
+    for position, run in enumerate(arguments.runs(args, batching, False, advertised)):
+        if run.unsupported:
+            report.unsupported(run, run.unsupported)
+            continue
         if probe(run, tls) in UNSUPPORTED:
-            report.unsupported(run)
+            report.unsupported(run, arguments.NOT_SERVED)
             continue
         server_before, client_before = server_stats(tls), stats.process_cpu()
         number.value = position
@@ -196,10 +243,10 @@ if __name__ == "__main__":
         window = stats.Window.starting(begin.value, args.warmup, args.time_limit, args.calls_per_second, run.in_flight)
         report.add(run, window, tally, sample)
         if args.between_runs == "reconnect":
-            earlier = (stats.sockets_in_use(), server_stats(tls)["memory_bytes"])
+            earlier = (stats.sockets_in_use(), server_stats(tls)["memory_current_bytes"])
             for _ in range(stats.SETTLE_ROUNDS):
                 time.sleep(stats.SETTLE_INTERVAL_SECONDS)
-                later = (stats.sockets_in_use(), server_stats(tls)["memory_bytes"])
+                later = (stats.sockets_in_use(), server_stats(tls)["memory_current_bytes"])
                 if stats.settled(earlier, later):
                     break
                 earlier = later

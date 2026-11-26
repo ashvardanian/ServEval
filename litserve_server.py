@@ -1,7 +1,7 @@
 """LitServe serving the tool workload, plain and through its own batcher.
 
 LitServe hands an API only the decoded JSON body, never a raw stream, the path, the query string or the headers, so
-it has no context, fan-out, raw or full routes. It binds by address alone, so it cannot pin a device.
+it has no context upload, download, fan-out, raw or full routes. It binds by address alone, so it cannot pin a device.
 """
 
 import litserve
@@ -51,7 +51,9 @@ if __name__ == "__main__":
         workers_per_device=max(1, args.threads // 2),
         healthcheck_path="/ready",
     )
-    server.app.add_api_route("/health", lambda: Response(payloads.health("litserve", "httpx", True)), methods=["GET"])
+    server.app.add_api_route(
+        "/health", lambda: Response(payloads.health("litserve", "httpx", args.batch_size)), methods=["GET"]
+    )
     server.app.add_api_route("/stats", lambda: Response(stats.unit_json()), methods=["GET"])
     server.run(
         host=interface.addresses[0],

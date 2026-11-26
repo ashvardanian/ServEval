@@ -1,4 +1,4 @@
-"""FastAPI on Uvicorn serving the tool, context and fan-out workloads, one worker process per thread."""
+"""FastAPI on Uvicorn serving the tool, context, download and fan-out workloads, one worker process per thread."""
 
 import asyncio
 import itertools
@@ -93,6 +93,19 @@ async def context(request: Request) -> Response:
     return Response(payloads.count_reply(count), media_type="text/plain")
 
 
+@app.get("/context")
+async def download(bytes: int) -> Response:
+    """The first `bytes` bytes of the body each worker prepares on its first download, which Uvicorn writes as the
+    socket drains; 416 when the server prepared fewer, 500 when it could not prepare any."""
+    prepared = arguments.download_body(args)
+    if prepared is None:
+        return Response(status_code=500)
+    body = payloads.download(prepared, bytes)
+    if body is None:
+        return Response(status_code=416)
+    return Response(body, media_type="application/octet-stream")
+
+
 @app.post("/fanout")
 async def fanout(request: Request, width: int) -> Response:
     body = await request.body()
@@ -112,7 +125,7 @@ async def unit() -> Response:
 
 @app.get("/health")
 async def health() -> Response:
-    return Response(payloads.health("fastapi", "httpx", False), media_type="application/json")
+    return Response(payloads.health("fastapi", "httpx", None), media_type="application/json")
 
 
 if __name__ == "__main__":

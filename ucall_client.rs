@@ -2,6 +2,11 @@
 //! under `--between-runs keep`, opened up front by concurrent health checks, and driving its share of the slots on the
 //! schedule `stats::Slot` keeps, without an async runtime. UCall's client binds neither a device nor an address, so the
 //! kernel routes each target by its subnet.
+//!
+//! UCall pipelines only idempotent calls, per RFC 9112 section 9.3.2, so a run keeping several calls in flight per
+//! connection sends its tool calls as PUT, which the UCall servers answer as they answer POST; context uploads already
+//! are. A fan-out's POST is not idempotent, so its deeper runs, and handshake runs, whose calls close their connection,
+//! are `unsupported`.
 
 use std::{
     borrow::Cow,
@@ -15,21 +20,35 @@ use std::{
 };
 
 use ucall::{
-    Client, ClientCall, ClientCallOptions, ClientOptions, Completed, HTTPStatus, NoiseKey, PeerAuthorizer, Status, Verb,
+    BodyDelivery, Client, ClientCall, ClientCallOptions, ClientOptions, Completed, HTTPStatus, NoiseKey,
+    PeerAuthorizer, Response, Status, Verb,
 };
 
 use serveval::{
     arguments::{self, BetweenRuns, ClientArgs, Phase, Run, Security, Workload},
     payloads::{self, ToolParts},
     results::{Pair, Report, Sample},
-    stats::{self, Failure, Tally, UnitStats, Window},
+    stats::{self, Failure, ServerStats, Tally, UnitStats, Window},
 };
 
 const JSON: &[u8] = b"content-type: application/json";
 const IDENTITY: &[u8] = b"accept-encoding: identity";
 const CLOSE: &[u8] = b"connection: close";
+/// Why a fan-out run keeping several calls in flight per connection cannot run.
+const FANOUT_NOT_IDEMPOTENT: &str = "fan-out calls are not idempotent";
+/// Why a handshake run keeping several calls in flight per connection cannot run: UCall pipelines no call behind one
+/// that closes its connection.
+const HANDSHAKE_CLOSES: &str = "handshake calls close their connection";
 
-/// UCall driving a UCall server through the tool, context and fan-out workloads.
+/// The requests a UCall server lets one connection pipeline, from the same `/health` reply as `Pair`; servers that do
+/// not pipeline leave it out.
+#[derive(serde::Deserialize)]
+struct Pipelining {
+    #[serde(default)]
+    max_pipelined_requests_per_connection: Option<u32>,
+}
+
+/// UCall driving a UCall server through the tool, context, download and fan-out workloads.
 #[derive(clap::Parser)]
 #[command(about)]
 struct Cli {
@@ -78,8 +97,11 @@ struct Shared {
     /// This client's private key and the server's public one under Noise.
     keys: Option<(NoiseKey, NoiseKey)>,
     ring: Vec<ToolParts>,
-    /// A context body per `--body-bytes` size.
+    /// A context body per `--body-bytes` size, which an upload sends and a download must get back.
     contexts: Vec<&'static [u8]>,
+    /// The largest reply a call buffers when downloads are swept: the largest download and its reply's head, set
+    /// once from the servers' own reply; unset, UCall's default.
+    max_response_bytes: std::sync::OnceLock<usize>,
 }
 
 impl Shared {
@@ -91,16 +113,20 @@ impl Shared {
         }
     }
 
-    /// A client of `connections` connections, admitting the servers' key under Noise XX.
+    /// A client of `connections` connections, each pipelining up to `depth` of the `calls` it accepts at once,
+    /// admitting the servers' key under Noise XX.
     fn client<'handlers, F: Fn(&NoiseKey) -> bool + Sync>(
         &self,
-        connections: usize,
+        (connections, depth, calls): (usize, usize, usize),
         admit: &'handlers F,
     ) -> Client<'handlers> {
         let options = ClientOptions {
             connections,
+            pipelined_calls: depth,
+            calls,
             noise_private_key: self.keys.map(|(client, _)| client),
             peer_authorizer: self.keys.map(|_| PeerAuthorizer::new(admit)),
+            max_response_bytes: self.max_response_bytes.get().copied().unwrap_or_default(),
             ..Default::default()
         };
         Client::new(options).unwrap_or_else(|error| arguments::exit(&format!("UCall client: {error}")))
@@ -120,7 +146,7 @@ struct Exchange {
     reply: &'static [u8],
 }
 
-/// One configuration's calls: per target, one exchange per ring entry, or the one context upload.
+/// One configuration's calls: per target, one exchange per ring entry, or the one context upload or download.
 struct Load {
     run: Run,
     exchanges: Vec<Vec<Exchange>>,
@@ -143,12 +169,21 @@ impl Load {
             },
             reply,
         };
+        // Only idempotent calls pipeline, so deeper runs send tool calls as PUT.
+        let verb = match run.calls_in_flight_per_connection {
+            1 => Verb::Post,
+            _ => Verb::Put,
+        };
+        let position = args.body_bytes().iter().position(|&bytes| bytes == run.body_bytes);
+        let context = || shared.contexts[position.expect("every size has a body")];
         let exchanges = (0..shared.origins.len()).map(|target| match run.workload {
             Workload::Context => {
-                let position = args.body_bytes.iter().position(|&bytes| bytes == run.body_bytes);
-                let body = shared.contexts[position.expect("every size has a body")];
-                let reply = keep(payloads::count_reply(body.len() as u64).into_bytes().into_boxed_slice());
-                vec![exchange(target, Verb::Put, "/context", Vec::new(), body, reply)]
+                let reply = keep(payloads::count_reply(run.body_bytes).into_bytes().into_boxed_slice());
+                vec![exchange(target, Verb::Put, "/context", Vec::new(), context(), reply)]
+            }
+            Workload::Download => {
+                let path = payloads::download_path(run.body_bytes);
+                vec![exchange(target, Verb::Get, &path, Vec::new(), &[], context())]
             }
             _ => payloads::exchanges(&shared.ring, &run, args.width)
                 .into_iter()
@@ -162,7 +197,7 @@ impl Load {
                     };
                     let body = keep(parts.body.to_vec().into_boxed_slice());
                     let reply = keep(parts.reply.to_vec().into_boxed_slice());
-                    exchange(target, Verb::Post, &parts.path, extra, body, reply)
+                    exchange(target, verb, &parts.path, extra, body, reply)
                 })
                 .collect(),
         });
@@ -184,6 +219,32 @@ fn failure_of(status: Status) -> Failure {
         Status::Timeout => Failure::Timeout,
         _ => Failure::Connect,
     }
+}
+
+/// RFC 9112's status line of a 200 reply, with RFC 9110's reason phrase, as UCall's servers write it.
+const STATUS_LINE_OK: &str = "HTTP/1.1 200 OK\r\n";
+
+/// The bytes of a 200 reply's head as RFC 9112 frames it: the status line, every `name: value` field line, and the
+/// empty line ending the head.
+fn head_bytes(response: &Response) -> usize {
+    let fields = response
+        .fields()
+        .map(|(name, value)| name.len() + ": ".len() + value.len() + "\r\n".len());
+    STATUS_LINE_OK.len() + fields.sum::<usize>() + "\r\n".len()
+}
+
+/// The largest download and the head of the servers' reply to it, from one streamed download of that size whose body
+/// is pulled and dropped, so every buffered download fits; `None` when the server does not answer it with 200. It
+/// sends a steady call's headers, whose reply's `connection: keep-alive` is the longer of the two forms.
+fn largest_reply_bytes(shared: &Shared, control: &mut Client, largest: u64) -> Option<usize> {
+    let mut call = shared.get(0, &payloads::download_path(largest));
+    call.headers = vec![Cow::Borrowed(JSON), Cow::Borrowed(IDENTITY)];
+    call.options.body_delivery = BodyDelivery::Streamed;
+    let mut response = control.call(call).ok()?;
+    let head = head_bytes(&response);
+    let answered = response.status_code() == HTTPStatus::OK;
+    while response.body_chunk().is_ok_and(|chunk| !chunk.is_empty()) {}
+    answered.then_some(largest as usize + head)
 }
 
 /// The body bytes sent and received by a finished call, or why it failed.
@@ -347,13 +408,17 @@ struct Steps {
 fn drive_thread(shared: Arc<Shared>, thread: usize, threads: usize, steps: Steps) {
     let server_key = shared.keys.map(|(_, server)| server);
     let admit = move |key: &NoiseKey| Some(*key) == server_key;
-    let mut kept: Option<(Client, usize)> = None;
+    let mut kept: Option<(Client, (usize, usize, usize))> = None;
     while let Ok(load) = steps.loads.recv() {
         let run = &load.run;
         let connections = arguments::share(run.connections, thread, threads).max(1);
-        if kept.as_ref().is_none_or(|(_, kept)| *kept != connections) {
+        let depth = run.calls_in_flight_per_connection;
+        // The slots this thread drives, which may exceed its connections' depth by the remainders of the two splits.
+        let calls = arguments::share(run.in_flight, thread, threads).max(connections * depth);
+        let budget = (connections, depth, calls);
+        if kept.as_ref().is_none_or(|(_, kept)| *kept != budget) {
             drop(kept.take());
-            kept = Some((shared.client(connections, &admit), connections));
+            kept = Some((shared.client(budget, &admit), budget));
         }
         let (client, _) = kept.as_mut().expect("made above");
         if run.phase == Phase::Steady {
@@ -387,7 +452,7 @@ fn drive_thread(shared: Arc<Shared>, thread: usize, threads: usize, steps: Steps
 }
 
 /// The servers' cgroup counters, summed over the targets.
-fn server_stats(shared: &Shared, client: &mut Client) -> UnitStats {
+fn server_stats(shared: &Shared, client: &mut Client) -> ServerStats {
     let all: Vec<UnitStats> = (0..shared.origins.len())
         .map(|target| {
             let response = client.call(shared.get(target, "/stats")).ok();
@@ -397,6 +462,14 @@ fn server_stats(shared: &Shared, client: &mut Client) -> UnitStats {
         })
         .collect();
     UnitStats::sum(&all)
+}
+
+/// Exits on a report that could not be written.
+fn unwritable(args: &ClientArgs, error: &std::io::Error) -> ! {
+    arguments::exit(&format!(
+        "--output=\"{}\" is not writable: {error}",
+        args.output.display()
+    ))
 }
 
 fn main() {
@@ -410,8 +483,9 @@ fn main() {
         ucall::Security::None => "http",
         _ => "http+noise",
     };
-    let contexts = match args.workloads.contains(&Workload::Context) {
-        true => (args.body_bytes.iter())
+    let bodies = [Workload::Context, Workload::Download];
+    let contexts = match args.workloads.iter().any(|workload| bodies.contains(workload)) {
+        true => (args.body_bytes().iter())
             .map(|&bytes| {
                 keep(
                     payloads::context_body(args.common.seed.into(), bytes)
@@ -430,18 +504,47 @@ fn main() {
         keys,
         ring: payloads::tool_ring(args.common.seed.into()),
         contexts,
+        max_response_bytes: std::sync::OnceLock::new(),
         args,
     });
     let args = &shared.args;
     let server_key = shared.keys.map(|(_, server)| server);
     let admit = move |key: &NoiseKey| Some(*key) == server_key;
-    let mut control = shared.client(shared.origins.len(), &admit);
+    let targets = shared.origins.len();
+    let mut control = shared.client((targets, 1, targets), &admit);
     let health = control.call(shared.get(0, "/health"));
     let health = health.as_ref().ok().and_then(|response| response.body().ok());
-    let pair: Pair = health
-        .and_then(|health| serde_json::from_slice(health).ok())
+    let (served, pipelining): (Pair, Pipelining) = health
+        .and_then(|health| {
+            Some((
+                serde_json::from_slice(health).ok()?,
+                serde_json::from_slice(health).ok()?,
+            ))
+        })
         .unwrap_or_else(|| arguments::exit("no /health reply"));
-    let runs = args.runs(pair.batching, false);
+    // The row names this client, not the one `/health` names for the server's own pair.
+    let pair = Pair {
+        client: "ucall".into(),
+        ..served
+    };
+    let largest = match args.workloads.contains(&Workload::Download) {
+        true => args.body_bytes().iter().copied().max(),
+        false => None,
+    };
+    if let Some(bytes) = largest.and_then(|largest| largest_reply_bytes(&shared, &mut control, largest)) {
+        let _ = shared.max_response_bytes.set(bytes);
+        control = shared.client((targets, 1, targets), &admit);
+    }
+    // `server-maximum` is the server's pipelining depth, or, from a server that reports none, its stream limit.
+    let advertised = (pipelining.max_pipelined_requests_per_connection).or(pair.max_concurrent_streams_per_connection);
+    let mut runs = args.runs(pair.batching, true, advertised);
+    for run in runs.iter_mut().filter(|run| run.calls_in_flight_per_connection > 1) {
+        run.unsupported = match (run.workload, run.phase) {
+            (Workload::Fanout, _) => Some(FANOUT_NOT_IDEMPOTENT),
+            (_, Phase::Handshake) => Some(HANDSHAKE_CLOSES),
+            _ => None,
+        };
+    }
     let mut report = Report::new(args, pair);
     let threads = args.common.threads.0.get();
     let (ready, readied) = mpsc::channel();
@@ -467,12 +570,20 @@ fn main() {
         .unzip();
     drop((ready, finished));
     for (number, run) in runs.into_iter().enumerate() {
+        if let Some(reason) = run.unsupported {
+            if let Err(error) = report.unsupported(args, &run, reason) {
+                unwritable(args, &error);
+            }
+            continue;
+        }
         let load = Arc::new(Load::new(&shared, run));
         let probe = control
             .call(load.exchange(0, 0).call.clone())
             .map(|response| response.status_code());
         if let Ok(HTTPStatus::NOT_FOUND | HTTPStatus::METHOD_NOT_ALLOWED | HTTPStatus::NOT_IMPLEMENTED) = probe {
-            report.unsupported(&run);
+            if let Err(error) = report.unsupported(args, &run, arguments::NOT_SERVED) {
+                unwritable(args, &error);
+            }
             continue;
         }
         let server_before = server_stats(&shared, &mut control);
@@ -504,21 +615,18 @@ fn main() {
             client_opens: [opens_before, opens_after],
         };
         if let Err(error) = report.add(args, &run, &window, &tally, &sample) {
-            arguments::exit(&format!(
-                "--output=\"{}\" is not writable: {error}",
-                args.output.display()
-            ));
+            unwritable(args, &error);
         }
         if args.between_runs == BetweenRuns::Reconnect {
             let mut earlier = (
                 stats::sockets_in_use(),
-                server_stats(&shared, &mut control).memory_bytes,
+                server_stats(&shared, &mut control).memory_current_bytes,
             );
             for _ in 0..stats::SETTLE_ROUNDS {
                 thread::sleep(stats::SETTLE_INTERVAL);
                 let later = (
                     stats::sockets_in_use(),
-                    server_stats(&shared, &mut control).memory_bytes,
+                    server_stats(&shared, &mut control).memory_current_bytes,
                 );
                 if stats::settled(earlier, later) {
                     break;

@@ -29,7 +29,6 @@ OPTIONS = (
     ("grpc.max_receive_message_length", -1),
     ("grpc.max_send_message_length", -1),
 )
-CHUNK_BYTES = 64 << 10
 ring = payloads.tool_ring(args.seed)
 messages = [
     protos.ToolCall(
@@ -61,12 +60,16 @@ assert all(
     message.ByteSize() == payloads.TOOL_BYTES and reply.ByteSize() == full.ByteSize() == payloads.REPLY_BYTES
     for message, reply, full in zip(messages, replies, full_replies)
 ), "the tool messages drifted from 1024 and 256 bytes"
-contexts = (
-    {size: payloads.context_body(args.seed, size) for size in args.body_bytes} if "context" in args.workloads else {}
-)
+# The body each upload sends and each download must get back, per size.
+bodies = {"context", "download"} & set(args.workloads)
+contexts = {size: payloads.context_body(args.seed, size) for size in arguments.body_bytes(args)} if bodies else {}
 chunks = {
-    size: [protos.Chunk(data=body[offset : offset + CHUNK_BYTES]) for offset in range(0, size, CHUNK_BYTES)]
+    size: [
+        protos.Chunk(data=body[offset : offset + payloads.CHUNK_BYTES])
+        for offset in range(0, size, payloads.CHUNK_BYTES)
+    ]
     for size, body in contexts.items()
+    if "context" in args.workloads
 }
 WIDTH = (("width", str(args.width)),)
 
@@ -82,6 +85,10 @@ async def call_once(run: arguments.Run, stub, sequence: int) -> tuple[int, int] 
     if run.workload == "context":
         reply = await stub.Context(iter(chunks[run.body_bytes]))
         return (run.body_bytes, reply.ByteSize()) if reply.bytes == run.body_bytes else "wrong_reply"
+    if run.workload == "download":
+        received = [chunk.data async for chunk in stub.Download(protos.Count(bytes=run.body_bytes))]
+        body = b"".join(received)
+        return (0, len(body)) if body == contexts[run.body_bytes] else "wrong_reply"
     index = sequence % payloads.RING
     sizes = (payloads.TOOL_BYTES, payloads.REPLY_BYTES)
     if run.workload == "fanout":
@@ -105,18 +112,12 @@ def failure(error: grpc.aio.AioRpcError) -> str:
 
 
 async def server_stats(stubs) -> dict:
-    """The servers' cgroup counters, summed over the targets."""
-    replies = [await stub.Stats(protos.Empty()) for stub in stubs]
-
-    def known(field: str) -> bool:
-        return field == "cores" or all(reply.HasField(field) for reply in replies)
-
-    def total(field: str):
-        values = [getattr(reply, field) for reply in replies]
-        return None if not known(field) else max(values) if field == "tcp_active_opens" else sum(values)
-
-    fields = ("cpu_microseconds", "memory_bytes", "cores", "memory_limit", "tcp_active_opens")
-    return {field: total(field) for field in fields}
+    """The servers' `Stats` replies as one server's, as `stats.server_stats` sums them."""
+    replies = []
+    for stub in stubs:
+        call = stub.Stats(protos.Empty())
+        replies.append(stats.from_grpc_reply(await call, await call.initial_metadata()))
+    return stats.server_stats(replies)
 
 
 async def measure(run: arguments.Run, index: int, processes: int, stubs, channels: list[list[grpc.aio.Channel]]):
@@ -184,15 +185,20 @@ def work(index: int, processes: int, inbox, outbox) -> None:
 
 async def main() -> None:
     stubs = [services.AgentStub(channel(target)) for target in range(len(targets))]
-    health = await stubs[0].Health(protos.Empty())
-    report = results.Report(args, health.framework, health.client)
+    checking = stubs[0].Health(protos.Empty())
+    health = await checking
+    # `HealthReply` has no field for the stream limit, so the server sends it as metadata, absent for no limit.
+    advertised = dict(await checking.initial_metadata()).get(payloads.MAX_CONCURRENT_STREAMS_METADATA, "")
+    advertised = int(advertised) if advertised.isascii() and advertised.isdigit() else None
+    # The row names this client, not the one `Health` names for the server's own pair.
+    report = results.Report(args, health.framework, "grpc.aio")
     loop = asyncio.get_running_loop()
-    for position, run in enumerate(arguments.runs(args, health.batching, multiplexed=True)):
+    for position, run in enumerate(arguments.runs(args, health.batching, True, advertised)):
         try:
             await call_once(run, stubs[0], 0)
         except grpc.aio.AioRpcError as error:
             if error.code() == grpc.StatusCode.UNIMPLEMENTED:
-                report.unsupported(run)
+                report.unsupported(run, arguments.NOT_SERVED)
                 continue
         server_before, client_before = await server_stats(stubs), stats.process_cpu()
         number.value = position
@@ -214,10 +220,10 @@ async def main() -> None:
         window = stats.Window.starting(begin.value, args.warmup, args.time_limit, args.calls_per_second, run.in_flight)
         report.add(run, window, tally, sample)
         if args.between_runs == "reconnect":
-            earlier = (stats.sockets_in_use(), (await server_stats(stubs))["memory_bytes"])
+            earlier = (stats.sockets_in_use(), (await server_stats(stubs))["memory_current_bytes"])
             for _ in range(stats.SETTLE_ROUNDS):
                 await asyncio.sleep(stats.SETTLE_INTERVAL_SECONDS)
-                later = (stats.sockets_in_use(), (await server_stats(stubs))["memory_bytes"])
+                later = (stats.sockets_in_use(), (await server_stats(stubs))["memory_current_bytes"])
                 if stats.settled(earlier, later):
                     break
                 earlier = later

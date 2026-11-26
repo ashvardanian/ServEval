@@ -12,13 +12,13 @@ use tonic::{metadata::MetadataValue, transport::Channel, Code, Request, Status};
 use serveval::{
     arguments::{self, BetweenRuns, ClientArgs, Parsing, Phase, Run, Workload},
     payloads::{self, ToolParts},
-    proto::{agent_client::AgentClient, Chunk, Empty, ToolCall, ToolReply},
+    proto::{agent_client::AgentClient, Chunk, Count, Empty, ToolCall, ToolReply},
     results::{Pair, Report, Sample},
     security,
-    stats::{self, Failure, Slot, Tally, UnitStats, Window},
+    stats::{self, Failure, ServerStats, Slot, Tally, UnitStats, Window},
 };
 
-/// tonic driving the tonic server through the tool, context and fan-out workloads.
+/// tonic driving the tonic server through the tool, context, download and fan-out workloads.
 #[derive(clap::Parser)]
 #[command(about)]
 struct Cli {
@@ -27,9 +27,6 @@ struct Cli {
 }
 
 type Client = AgentClient<Channel>;
-
-/// Context uploads stream in chunks well under gRPC's default 4MB message limit.
-const CHUNK_BYTES: usize = 64 << 10;
 
 struct Shared {
     args: ClientArgs,
@@ -63,6 +60,7 @@ impl Call {
 struct Load {
     shared: Arc<Shared>,
     run: Run,
+    /// The body a context upload sends, or a download must get back.
     context: Bytes,
 }
 
@@ -81,13 +79,21 @@ async fn exchange(load: &Load, client: &mut Client, sequence: usize) -> Result<O
     let length = load.context.len();
     if load.run.workload == Workload::Context {
         let chunks: Vec<Chunk> = (0..length)
-            .step_by(CHUNK_BYTES)
+            .step_by(payloads::CHUNK_BYTES)
             .map(|start| Chunk {
-                data: load.context.slice(start..length.min(start + CHUNK_BYTES)),
+                data: load.context.slice(start..length.min(start + payloads::CHUNK_BYTES)),
             })
             .collect();
         let count = client.context(futures::stream::iter(chunks)).await?.into_inner();
         return Ok((count.bytes == length as u64).then_some((length as u64, count.encoded_len() as u64)));
+    }
+    if load.run.workload == Workload::Download {
+        let mut chunks = client.download(Count { bytes: length as u64 }).await?.into_inner();
+        let mut check = payloads::DownloadCheck::new(&load.context);
+        while let Some(chunk) = chunks.message().await? {
+            check.chunk(&chunk.data);
+        }
+        return Ok(check.matched().map(|received| (0, received)));
     }
     let call = &load.shared.ring[sequence % payloads::RING];
     let sizes = (payloads::TOOL_BYTES as u64, payloads::REPLY_BYTES as u64);
@@ -129,23 +135,11 @@ fn failure(outcome: Result<Option<(u64, u64)>, Status>) -> Result<(u64, u64), Fa
     }
 }
 
-async fn server_stats(shared: &Shared) -> UnitStats {
+async fn server_stats(shared: &Shared) -> ServerStats {
     let mut all = Vec::new();
     for target in 0..shared.targets.len() {
-        let reply = client(shared, target, 0)
-            .stats(Empty {})
-            .await
-            .map(tonic::Response::into_inner);
-        all.push(reply.map_or_else(
-            |_| UnitStats::default(),
-            |reply| UnitStats {
-                cpu_microseconds: reply.cpu_microseconds,
-                memory_bytes: reply.memory_bytes,
-                cores: reply.cores,
-                memory_limit: reply.memory_limit,
-                tcp_active_opens: reply.tcp_active_opens,
-            },
-        ));
+        let reply = client(shared, target, 0).stats(Empty {}).await;
+        all.push(reply.map_or_else(|_| UnitStats::default(), UnitStats::from_response));
     }
     UnitStats::sum(&all)
 }
@@ -232,22 +226,25 @@ async fn measure(args: ClientArgs) -> io::Result<()> {
         args,
     });
     let args = &shared.args;
-    let health = client(&shared, 0, 0)
-        .health(Empty {})
-        .await
-        .map_err(io::Error::other)?
-        .into_inner();
+    let health = client(&shared, 0, 0).health(Empty {}).await.map_err(io::Error::other)?;
+    // `HealthReply` has no field for the stream limit, so the server sends it as metadata, absent for no limit.
+    let advertised = health.metadata().get(payloads::MAX_CONCURRENT_STREAMS_METADATA);
+    let advertised = advertised.and_then(|value| value.to_str().ok()?.parse().ok());
+    let health = health.into_inner();
+    // The row names this client, not the one `Health` names for the server's own pair.
     let pair = Pair {
         framework: health.framework,
-        client: health.client,
+        client: "tonic".into(),
         batching: health.batching,
+        max_concurrent_streams_per_connection: advertised,
+        batch_size: None,
     };
-    let runs = args.runs(pair.batching, true);
+    let runs = args.runs(pair.batching, true, pair.max_concurrent_streams_per_connection);
     let mut report = Report::new(args, pair);
     let mut kept: Vec<Vec<Client>> = shared.targets.iter().map(|_| Vec::new()).collect();
     for (number, run) in runs.into_iter().enumerate() {
         let context = match run.workload {
-            Workload::Context => payloads::context_body(args.common.seed.into(), run.body_bytes),
+            Workload::Context | Workload::Download => payloads::context_body(args.common.seed.into(), run.body_bytes),
             _ => Bytes::new(),
         };
         let load = Arc::new(Load {
@@ -257,7 +254,7 @@ async fn measure(args: ClientArgs) -> io::Result<()> {
         });
         if let Err(status) = exchange(&load, &mut client(&shared, 0, 0), 0).await {
             if status.code() == Code::Unimplemented {
-                report.unsupported(&run);
+                report.unsupported(args, &run, arguments::NOT_SERVED)?;
                 continue;
             }
         }
@@ -295,10 +292,16 @@ async fn measure(args: ClientArgs) -> io::Result<()> {
         report.add(args, &run, &window, &tally, &sample)?;
         if args.between_runs == BetweenRuns::Reconnect {
             kept.iter_mut().for_each(Vec::clear);
-            let mut earlier = (stats::sockets_in_use(), server_stats(&shared).await.memory_bytes);
+            let mut earlier = (
+                stats::sockets_in_use(),
+                server_stats(&shared).await.memory_current_bytes,
+            );
             for _ in 0..stats::SETTLE_ROUNDS {
                 tokio::time::sleep(stats::SETTLE_INTERVAL).await;
-                let later = (stats::sockets_in_use(), server_stats(&shared).await.memory_bytes);
+                let later = (
+                    stats::sockets_in_use(),
+                    server_stats(&shared).await.memory_current_bytes,
+                );
                 if stats::settled(earlier, later) {
                     break;
                 }

@@ -12,11 +12,11 @@ use actix_web::{
 use futures::{future::try_join_all, StreamExt};
 
 use serveval::{
-    arguments::{self, Security, ServerArgs},
+    arguments::{self, DownloadBody, Security, ServerArgs},
     payloads, security, stats,
 };
 
-/// actix-web serving the tool, context and fan-out workloads.
+/// actix-web serving the tool, context, download and fan-out workloads.
 #[derive(clap::Parser)]
 #[command(about)]
 struct Cli {
@@ -75,6 +75,18 @@ async fn context(mut body: web::Payload) -> actix_web::Result<String> {
     Ok(payloads::count_reply(bytes))
 }
 
+/// The first `bytes` bytes of the prepared download body, which actix writes as the socket drains; 416 when the server
+/// prepared fewer, 500 when it could not prepare any.
+async fn download(prepared: web::Data<DownloadBody>, query: web::Query<payloads::DownloadQuery>) -> HttpResponse {
+    let Some(prepared) = prepared.get() else {
+        return HttpResponse::InternalServerError().finish();
+    };
+    match payloads::download(prepared, query.bytes) {
+        Some(body) => HttpResponse::Ok().content_type(ContentType::octet_stream()).body(body),
+        None => HttpResponse::RangeNotSatisfiable().finish(),
+    }
+}
+
 async fn fanout(fan: web::Data<Fanout>, query: web::Query<Width>, body: web::Bytes) -> HttpResponse {
     let Ok(call) = serde_json::from_slice::<payloads::ToolCall>(&body) else {
         return HttpResponse::BadRequest().finish();
@@ -111,6 +123,7 @@ async fn main() -> std::io::Result<()> {
     security::require_tls_or_none(&args.common, "actix");
     let interface = args.single_interface("actix").clone();
     let workers = args.common.threads.0.get();
+    let prepared = web::Data::from(args.download_body());
     let client_config = security::tls_client_config(&args.common, &[b"http/1.1"])?;
     let scheme = if args.common.security == Security::Tls {
         "https"
@@ -138,7 +151,9 @@ async fn main() -> std::io::Result<()> {
             .route("/raw", web::post().to(raw))
             .route("/tool", web::post().to(tool))
             .route("/tool/{name}", web::post().to(full))
+            .app_data(prepared.clone())
             .route("/context", web::put().to(context))
+            .route("/context", web::get().to(download))
             .route("/fanout", web::post().to(fanout))
             .route(
                 "/stats",
@@ -153,7 +168,7 @@ async fn main() -> std::io::Result<()> {
                 web::get().to(|| async {
                     HttpResponse::Ok()
                         .content_type(ContentType::json())
-                        .body(payloads::health("actix", "awc", false))
+                        .body(payloads::health("actix", "awc", None))
                 }),
             )
     })

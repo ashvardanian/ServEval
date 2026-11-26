@@ -76,6 +76,8 @@ tonic = { version = "0.14", optional = true, features = ["tls-connect-info"] }
 tonic-prost = { version = "0.14", optional = true }
 tower = { version = "0.5", optional = true, features = ["util"] }
 ucall = { version = "1.0.0-rc.1", git = "https://github.com/unum-cloud/UCall", rev = "65fb9cc2c9275f43372d4889c2c2861a511e0055", optional = true }
+# The same ForkUnion UCall pins, so both resolve to one crate; the UCall servers place their polling threads with it.
+forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion", rev = "59662d01e66ee40a87d8f5b28387a29d16c78ddd", default-features = false, optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14", optional = true }
@@ -88,7 +90,7 @@ default = ["axum", "actix", "tonic", "ucall"]
 axum = ["dep:axum", "dep:http-body-util", "dep:hyper", "dep:hyper-rustls", "dep:hyper-util"]
 actix = ["dep:actix-web", "dep:awc", "dep:actix-tls"]
 tonic = ["dep:prost", "dep:tonic", "dep:tonic-prost", "dep:tonic-prost-build", "dep:tower", "dep:hyper-util"]
-ucall = ["dep:ucall"]
+ucall = ["dep:ucall", "dep:forkunion"]
 
 [profile.release]
 lto = "thin"

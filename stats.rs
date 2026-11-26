@@ -1,8 +1,11 @@
 //! Latency histograms that merge exactly across processes, the call schedule, and cgroup and process counters.
 
 use std::{
+    collections::BTreeMap,
+    fs::File,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -292,50 +295,289 @@ impl Slot {
     }
 }
 
-/// A process's cgroup v2 counters, which cover every worker process and the kernel's socket memory.
-#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+/// The `/stats` reply: this process's cgroup v2 counters, which cover every process of its systemd unit and the
+/// kernel's socket memory, with the unit's cores and the box's `tcp_active_opens`. Each server runs in its own unit,
+/// so a reply covers one server. A counter is `None` where its file is missing, as outside a cgroup v2 hierarchy, and
+/// a field a server leaves out reads as missing.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct UnitStats {
+    /// The cgroup's `usage_usec` from `cpu.stat`.
     pub cpu_microseconds: Option<u64>,
-    pub memory_bytes: Option<u64>,
-    pub cores: u64,
+    /// The cgroup's `memory.current`.
+    pub memory_current_bytes: Option<u64>,
+    /// The cgroup's `memory.peak` since the previous `/stats`, as `MemoryPeak` reads it.
+    pub memory_peak_bytes: Option<u64>,
+    /// The smallest `memory.max` of the cgroup and its ancestors.
     pub memory_limit: Option<u64>,
+    /// Cores in the `sched_getaffinity` mask.
+    pub cores: u64,
+    /// The `sched_getaffinity` mask as a cpuset list, like `8-9`.
+    pub cpu_list: String,
+    /// The cgroup's last path component, like `serveval-server-axum-8545-0.service`.
+    pub unit: Option<String>,
     /// The box's `tcp_active_opens`, not the unit's.
     pub tcp_active_opens: Option<u64>,
+    /// The serving library's own counters summed over its event loops, by name, like UCall's `kernel_enters`, for
+    /// servers whose library keeps them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_loop_counters: Option<BTreeMap<String, u64>>,
+}
+
+/// The `/stats` replies of every target as one server's.
+#[derive(Clone, Default)]
+pub struct ServerStats {
+    pub cpu_microseconds: Option<u64>,
+    pub memory_current_bytes: Option<u64>,
+    pub memory_peak_bytes: Option<u64>,
+    pub memory_limit: Option<u64>,
+    pub cores: u64,
+    /// The union of the units' cpuset lists.
+    pub cpu_list: String,
+    /// Each unit once, in target order.
+    pub units: Vec<String>,
+    pub tcp_active_opens: Option<u64>,
+    /// The counted units' event-loop counters summed by name, missing unless every counted unit keeps them.
+    pub event_loop_counters: Option<BTreeMap<String, u64>>,
 }
 
 impl UnitStats {
-    /// The counters of several servers together; a counter missing from any of them is missing.
-    pub fn sum(all: &[UnitStats]) -> Self {
-        let total = |field: fn(&UnitStats) -> Option<u64>| all.iter().map(field).sum::<Option<u64>>();
-        UnitStats {
+    /// The replies of every target as one server's: counters summed, `cpu_list` unioned, and `units` listing each
+    /// unit once. A unit serving several targets, like UCall's one server on both network interfaces, answers each
+    /// alike, so only its first reply counts: a second would count its cores twice and see its memory peak just
+    /// reset. A counter missing from any counted reply is missing, and `tcp_active_opens`, the box's, is the largest.
+    pub fn sum(all: &[UnitStats]) -> ServerStats {
+        let mut counted: Vec<&UnitStats> = Vec::new();
+        let mut units: Vec<String> = Vec::new();
+        for reply in all {
+            if let Some(unit) = &reply.unit {
+                if units.contains(unit) {
+                    continue;
+                }
+                units.push(unit.clone());
+            }
+            counted.push(reply);
+        }
+        let total =
+            |field: fn(&UnitStats) -> Option<u64>| counted.iter().map(|stats| field(stats)).sum::<Option<u64>>();
+        let cpus = counted.iter().flat_map(|stats| parse_cpus(&stats.cpu_list));
+        ServerStats {
             cpu_microseconds: total(|stats| stats.cpu_microseconds),
-            memory_bytes: total(|stats| stats.memory_bytes),
-            cores: all.iter().map(|stats| stats.cores).sum(),
+            memory_current_bytes: total(|stats| stats.memory_current_bytes),
+            memory_peak_bytes: total(|stats| stats.memory_peak_bytes),
             memory_limit: total(|stats| stats.memory_limit),
-            // Every target on one box reads the same counter.
-            tcp_active_opens: all.iter().map(|stats| stats.tcp_active_opens).max().flatten(),
+            cores: counted.iter().map(|stats| stats.cores).sum(),
+            cpu_list: spell_cpus(cpus.collect()),
+            units,
+            tcp_active_opens: all
+                .iter()
+                .map(|stats| stats.tcp_active_opens)
+                .collect::<Option<Vec<u64>>>()
+                .and_then(|opens| opens.into_iter().max()),
+            event_loop_counters: counted.iter().try_fold(BTreeMap::new(), |mut sums, stats| {
+                for (name, value) in stats.event_loop_counters.as_ref()? {
+                    *sums.entry(name.clone()).or_insert(0) += value;
+                }
+                Some(sums)
+            }),
         }
     }
 }
 
-/// This process's cgroup counters; `None` where the platform has no cgroup v2.
-pub fn unit_stats() -> UnitStats {
-    let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get() as u64);
-    let Some(directory) = cgroup_directory() else {
-        return UnitStats {
-            cores,
-            tcp_active_opens: tcp_active_opens(),
-            ..UnitStats::default()
+/// Each event-loop counter's growth from `before` to `after`, the counters of one server sampled around a window.
+pub fn counter_growth(
+    before: &Option<BTreeMap<String, u64>>,
+    after: &Option<BTreeMap<String, u64>>,
+) -> Option<BTreeMap<String, u64>> {
+    let (before, after) = (before.as_ref()?, after.as_ref()?);
+    let growth = |(name, value): (&String, &u64)| {
+        let earlier = before.get(name).copied().unwrap_or(0);
+        (name.clone(), value.saturating_sub(earlier))
+    };
+    Some(after.iter().map(growth).collect())
+}
+
+/// Each nonzero counter of `growth` per request the loops parsed over the same span; missing without requests.
+pub fn per_request(growth: &Option<BTreeMap<String, u64>>) -> Option<BTreeMap<String, f64>> {
+    let growth = growth.as_ref()?;
+    let requests = growth.get("requests").copied().filter(|&requests| requests > 0)? as f64;
+    let nonzero = growth.iter().filter(|(_, &value)| value > 0);
+    Some(
+        nonzero
+            .map(|(name, &value)| (name.clone(), value as f64 / requests))
+            .collect(),
+    )
+}
+
+/// The `/stats` fields `serveval.proto`'s `StatsReply` has no field for, which the gRPC pairs send as response
+/// metadata, each under its name with dashes for underscores.
+#[cfg(feature = "tonic")]
+const METADATA_FIELDS: [&str; 3] = ["memory-peak-bytes", "cpu-list", "unit"];
+
+#[cfg(feature = "tonic")]
+impl UnitStats {
+    /// The gRPC `Stats` reply: `StatsReply`, whose `memory_bytes` carries `memory_current_bytes`, and the fields it
+    /// lacks as metadata.
+    pub fn into_response(self) -> tonic::Response<crate::proto::StatsReply> {
+        let mut response = tonic::Response::new(crate::proto::StatsReply {
+            cpu_microseconds: self.cpu_microseconds,
+            memory_bytes: self.memory_current_bytes,
+            cores: self.cores,
+            memory_limit: self.memory_limit,
+            tcp_active_opens: self.tcp_active_opens,
+        });
+        let values = [
+            self.memory_peak_bytes.map(|peak| peak.to_string()),
+            Some(self.cpu_list),
+            self.unit,
+        ];
+        for (name, value) in METADATA_FIELDS.into_iter().zip(values) {
+            if let Some(value) = value.and_then(|value| value.parse().ok()) {
+                response.metadata_mut().insert(name, value);
+            }
+        }
+        response
+    }
+
+    /// Reads a reply `into_response` made; a field missing from it reads as missing.
+    pub fn from_response(response: tonic::Response<crate::proto::StatsReply>) -> Self {
+        let text = |name: &str| {
+            let value = response.metadata().get(name)?;
+            value.to_str().ok().map(str::to_owned)
         };
+        let [peak, cpu_list, unit] = METADATA_FIELDS.map(text);
+        let reply = response.get_ref();
+        Self {
+            cpu_microseconds: reply.cpu_microseconds,
+            memory_current_bytes: reply.memory_bytes,
+            memory_peak_bytes: peak.and_then(|peak| peak.parse().ok()),
+            memory_limit: reply.memory_limit,
+            cores: reply.cores,
+            cpu_list: cpu_list.unwrap_or_default(),
+            unit,
+            tcp_active_opens: reply.tcp_active_opens,
+            event_loop_counters: None,
+        }
+    }
+}
+
+/// The cores of a cpuset list like `8-9,104-105`, in order; a malformed range is skipped.
+pub fn parse_cpus(text: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in text.trim().split(',').filter(|part| !part.is_empty()) {
+        let (first, last) = part.split_once('-').unwrap_or((part, part));
+        if let (Ok(first), Ok(last)) = (first.parse::<usize>(), last.parse::<usize>()) {
+            cpus.extend(first..=last);
+        }
+    }
+    cpus
+}
+
+/// Spells cores as a cpuset list like `8-9,104-105`, the way `parse_cpus` reads it.
+pub fn spell_cpus(mut cpus: Vec<usize>) -> String {
+    cpus.sort_unstable();
+    cpus.dedup();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for cpu in cpus {
+        match ranges.last_mut() {
+            Some((_, last)) if *last + 1 == cpu => *last = cpu,
+            _ => ranges.push((cpu, cpu)),
+        }
+    }
+    let spelled = ranges.iter().map(|&(first, last)| match first == last {
+        true => first.to_string(),
+        false => format!("{first}-{last}"),
+    });
+    spelled.collect::<Vec<_>>().join(",")
+}
+
+/// The cores this process may run on: its `sched_getaffinity` mask, or every core where the platform has none.
+pub fn allowed_cpus() -> Vec<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let read = unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+        if read == 0 {
+            let count = 8 * std::mem::size_of::<libc::cpu_set_t>();
+            return (0..count)
+                .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+                .collect();
+        }
+    }
+    (0..std::thread::available_parallelism().map_or(1, |cores| cores.get())).collect()
+}
+
+/// This process's systemd unit, the last component of its cgroup v2 path like
+/// `serveval-server-axum-8545-0.service`, or `None` outside a cgroup v2 hierarchy or at its root.
+pub fn unit_name() -> Option<String> {
+    let directory = cgroup_directory()?;
+    if directory == Path::new("/sys/fs/cgroup") {
+        return None;
+    }
+    Some(directory.file_name()?.to_string_lossy().into_owned())
+}
+
+/// The cgroup's `memory.peak` since the previous read, through one descriptor this process holds open.
+///
+/// Writing to an open `memory.peak` resets the peak only that descriptor reports, to the current usage, which Linux
+/// allows since 6.12; so a client's `/stats` before and after its window bracket that window's peak. The descriptor
+/// opens on the first read and again on every read until it opens: `memory.peak` belongs to root unless the launcher
+/// hands it to the server's user, and a peak that cannot be reset would cover the unit's whole life, so it reads as
+/// `None` instead.
+pub struct MemoryPeak {
+    // Two `/stats` replies served at once must not interleave one's read with the other's reset.
+    file: Mutex<Option<File>>,
+}
+
+impl MemoryPeak {
+    const fn new() -> Self {
+        Self { file: Mutex::new(None) }
+    }
+
+    /// The peak since the previous `take`, or since the cgroup started for the first, then resets it.
+    pub fn take(&self) -> Option<u64> {
+        use std::os::unix::fs::FileExt;
+
+        let mut file = self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if file.is_none() {
+            let path = cgroup_directory()?.join("memory.peak");
+            *file = Some(File::options().read(true).write(true).open(path).ok()?);
+        }
+        let file = file.as_ref()?;
+        let mut text = [0u8; 32];
+        let read = file.read_at(&mut text, 0).ok()?;
+        let peak = std::str::from_utf8(&text[..read]).ok()?.trim().parse().ok()?;
+        // The kernel takes any non-empty write as a reset and ignores the offset.
+        file.write_at(b"reset\n", 0).ok()?;
+        Some(peak)
+    }
+}
+
+/// The one `MemoryPeak` of this process, which every `/stats` reply reads.
+pub static MEMORY_PEAK: MemoryPeak = MemoryPeak::new();
+
+/// The `/stats` reply of this process, as `UnitStats` describes its fields.
+pub fn unit_stats() -> UnitStats {
+    let cpus = allowed_cpus();
+    let mut stats = UnitStats {
+        memory_peak_bytes: MEMORY_PEAK.take(),
+        cores: cpus.len() as u64,
+        cpu_list: spell_cpus(cpus),
+        unit: unit_name(),
+        tcp_active_opens: tcp_active_opens(),
+        ..UnitStats::default()
+    };
+    let Some(directory) = cgroup_directory() else {
+        return stats;
     };
     let read = |name: &str| std::fs::read_to_string(directory.join(name)).ok();
-    let cpu_microseconds = read("cpu.stat").and_then(|stat| {
+    stats.cpu_microseconds = read("cpu.stat").and_then(|stat| {
         stat.lines()
             .find_map(|line| line.strip_prefix("usage_usec "))
             .and_then(|value| value.trim().parse().ok())
     });
-    let memory_bytes = read("memory.current").and_then(|value| value.trim().parse().ok());
-    let memory_limit = directory
+    stats.memory_current_bytes = read("memory.current").and_then(|value| value.trim().parse().ok());
+    stats.memory_limit = directory
         .ancestors()
         .take_while(|ancestor| ancestor.starts_with("/sys/fs/cgroup"))
         .filter_map(|ancestor| {
@@ -346,13 +588,7 @@ pub fn unit_stats() -> UnitStats {
                 .ok()
         })
         .min();
-    UnitStats {
-        cpu_microseconds,
-        memory_bytes,
-        cores,
-        memory_limit,
-        tcp_active_opens: tcp_active_opens(),
-    }
+    stats
 }
 
 /// TCP connections this box opened since boot, every process together, from `/proc/net/snmp`.
@@ -430,6 +666,37 @@ mod tests {
             let edge = Histogram::upper_edge(Histogram::bin_of(nanoseconds));
             assert!(edge >= nanoseconds && edge - nanoseconds <= nanoseconds / 16);
         }
+    }
+
+    #[test]
+    fn one_unit_serving_two_targets_counts_once() {
+        assert_eq!(spell_cpus(parse_cpus("104-105,8,9")), "8-9,104-105");
+        let unit = |name: &str, cpu_list: &str| UnitStats {
+            cpu_microseconds: Some(10),
+            cores: 2,
+            cpu_list: cpu_list.into(),
+            unit: Some(name.into()),
+            ..UnitStats::default()
+        };
+        let one = UnitStats::sum(&[unit("a.service", "8-9"), unit("a.service", "8-9")]);
+        assert_eq!((one.cores, one.cpu_microseconds, one.units.len()), (2, Some(10), 1));
+        let two = UnitStats::sum(&[unit("a.service", "8-9"), unit("b.service", "104-105")]);
+        assert_eq!((two.cores, two.cpu_list.as_str()), (4, "8-9,104-105"));
+    }
+
+    #[cfg(feature = "tonic")]
+    #[test]
+    fn grpc_replies_carry_every_field() {
+        let sent = UnitStats {
+            memory_current_bytes: Some(3),
+            memory_peak_bytes: Some(5),
+            cores: 2,
+            cpu_list: "8-9".into(),
+            unit: Some("serveval-server-tonic-8545-0.service".into()),
+            ..UnitStats::default()
+        };
+        let read = UnitStats::from_response(sent.clone().into_response());
+        assert_eq!(serde_json::to_value(read).unwrap(), serde_json::to_value(sent).unwrap());
     }
 
     #[tokio::test]

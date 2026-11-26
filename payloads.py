@@ -12,6 +12,13 @@ import struct
 TOOL_BYTES = 1024
 REPLY_BYTES = 256
 RING = 1024
+# The largest message a gRPC receiver takes by default: gRPC core's `GRPC_DEFAULT_MAX_RECV_MESSAGE_LENGTH` and tonic's
+# `DEFAULT_MAX_RECV_MESSAGE_SIZE`, both 4MB.
+GRPC_DEFAULT_MAXIMUM_RECEIVE_MESSAGE_BYTES = 4 << 20
+# Bytes of each `Chunk` a gRPC upload or download streams: the default receive limit less the `data` field's own
+# framing, its one-byte tag and the four-byte varint its length takes from 2^21 up to 2^28, so each message is as large
+# as every default receiver takes and a body crosses in as few messages as the protocol allows.
+CHUNK_BYTES = GRPC_DEFAULT_MAXIMUM_RECEIVE_MESSAGE_BYTES - 1 - 4
 MESSAGE_TRACE_BYTES = 888
 MESSAGE_CONTENT_BYTES = 222
 JSON = {"content-type": "application/json"}
@@ -20,6 +27,9 @@ HEADERS = {**JSON, "accept-encoding": "identity"}
 TOOL_NAME = "search_documents"
 LANG = "en"
 AUTHORIZATION = "Bearer 6f1c09a4e2b7d35c81f0aa4e92d1c7b3"
+# The metadata entry of a gRPC `Health` reply carrying `max_concurrent_streams_per_connection`, which `HealthReply`
+# has no field for; a reply without it advertises no limit.
+MAX_CONCURRENT_STREAMS_METADATA = "max-concurrent-streams-per-connection"
 DIGESTS = (
     "69cb58f431dcf185b8fbea14a165f28edc5f80cfbb6f342501bce01d21f45286",
     "671c52debf7b9527575511306acc935b86ffce8f6b3549f5ef38d993d00e9966",
@@ -115,6 +125,16 @@ def context_body(seed: int, count: int) -> bytes:
     return split_mix_bytes(stream_key(seed, "context", 0), count)
 
 
+def download_path(count: int) -> str:
+    """The path of a download of `count` bytes."""
+    return f"/context?bytes={count}"
+
+
+def download(prepared: bytes, count: int) -> memoryview | None:
+    """The first `count` bytes of the prepared download body without copying them, None when it holds fewer."""
+    return memoryview(prepared)[:count] if 0 <= count <= len(prepared) else None
+
+
 @dataclasses.dataclass(frozen=True)
 class Exchange:
     """One HTTP tool or fan-out call as a client sends it, and the reply it must get back byte for byte; a `full`
@@ -174,9 +194,28 @@ def count_reply(count: int) -> bytes:
     return f"{count:016x}".encode()
 
 
-def health(framework: str, client: str, batching: bool) -> bytes:
-    """The `/health` body naming the pair and whether the server batches."""
-    return f'{{"framework":"{framework}","client":"{client}","batching":{str(batching).lower()}}}'.encode()
+def health(
+    framework: str,
+    client: str,
+    batch_size: int | None,
+    max_concurrent_streams_per_connection: int | None = None,
+    max_pipelined_requests_per_connection: int | None = None,
+) -> bytes:
+    """The `/health` body naming the pair, whether the server batches and its `--batch-size`, null when it does not,
+    and the `SETTINGS_MAX_CONCURRENT_STREAMS` it advertises, null for no limit, which HTTP/1.1 servers never set. A
+    server that pipelines HTTP/1.1 requests adds the `max_pipelined_requests_per_connection` one connection may have
+    in flight."""
+    streams = "null" if max_concurrent_streams_per_connection is None else max_concurrent_streams_per_connection
+    pipelined = (
+        ""
+        if max_pipelined_requests_per_connection is None
+        else f',"max_pipelined_requests_per_connection":{max_pipelined_requests_per_connection}'
+    )
+    return (
+        f'{{"framework":"{framework}","client":"{client}","batching":{str(batch_size is not None).lower()},'
+        f'"batch_size":{"null" if batch_size is None else batch_size},'
+        f'"max_concurrent_streams_per_connection":{streams}{pipelined}}}'
+    ).encode()
 
 
 if __name__ == "__main__":

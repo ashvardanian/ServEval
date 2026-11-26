@@ -1,4 +1,4 @@
-// The tool, context and fan-out workloads for the gRPC pairs, padded to the HTTP pairs' sizes.
+// The tool, context, download and fan-out workloads for the gRPC pairs, padded to the HTTP pairs' sizes.
 syntax = "proto3";
 
 package serveval;
@@ -12,6 +12,8 @@ service Agent {
     rpc Full(ToolCall) returns (ToolReply);
     // Counts the bytes of a streamed context upload.
     rpc Context(stream Chunk) returns (Count);
+    // Streams the first `bytes` bytes of the seeded context body in chunks, OUT_OF_RANGE past what the server prepared.
+    rpc Download(Count) returns (stream Chunk);
     // Forwards the call to `width` upstream Tool services, taken from the `width` metadata entry.
     rpc Fanout(ToolCall) returns (ToolReply);
     rpc Health(Empty) returns (HealthReply);

@@ -52,11 +52,24 @@ pub struct ServerArgs {
     /// Longest a batch waits to fill.
     #[arg(long, env = "SERVEVAL_BATCH_WAIT", default_value = "10ms", value_parser = parse_duration_flag)]
     pub batch_wait: Duration,
+    #[command(flatten)]
+    pub body_bytes: BodyBytes,
 }
 
 impl ServerArgs {
     pub fn admission(&self) -> usize {
         self.connections.iter().copied().max().unwrap_or(1)
+    }
+
+    /// The bytes every download is a prefix of, for the largest `--body-bytes` of this server's interfaces,
+    /// prepared on the first download, so a server that never serves one never derives the sweep.
+    pub fn download_body(&self) -> std::sync::Arc<DownloadBody> {
+        std::sync::Arc::new(DownloadBody {
+            seed: self.common.seed.into(),
+            given: self.body_bytes.given.clone(),
+            interfaces: self.common.interfaces.clone(),
+            prepared: std::sync::OnceLock::new(),
+        })
     }
 
     /// The one interface a competitor process binds; launch.py starts one process per memory domain.
@@ -67,6 +80,190 @@ impl ServerArgs {
                 "{framework} binds one interface per process; launch.py starts one per memory domain"
             )),
         }
+    }
+}
+
+/// `--body-bytes`, the context upload and download sizes, shared by clients and servers: a server prepares the largest
+/// once and serves every download from it.
+#[derive(clap::Args)]
+pub struct BodyBytes {
+    /// Context upload and download sizes to sweep, like 256KB,4MB,64MB; unset, powers of 4 from one TCP segment's
+    /// payload at the interfaces' MTU up to `net.ipv4.tcp_rmem`'s maximum.
+    #[arg(long = "body-bytes", env = "SERVEVAL_BODY_BYTES", value_delimiter = ',', value_parser = parse_size_flag)]
+    given: Vec<u64>,
+    #[arg(skip)]
+    resolved: std::sync::OnceLock<Vec<u64>>,
+}
+
+impl BodyBytes {
+    /// The sizes given, or `default_body_bytes` of `interfaces`, derived on first use; exits when they cannot be.
+    pub fn sizes(&self, interfaces: &[Interface]) -> &[u64] {
+        self.resolved.get_or_init(|| match self.given.is_empty() {
+            false => self.given.clone(),
+            true => default_body_bytes(interfaces).unwrap_or_else(|message| exit(&message)),
+        })
+    }
+}
+
+/// The bytes every download of a server is a prefix of, prepared once, on the first download.
+pub struct DownloadBody {
+    seed: u64,
+    given: Vec<u64>,
+    interfaces: Vec<Interface>,
+    prepared: std::sync::OnceLock<Option<bytes::Bytes>>,
+}
+
+impl DownloadBody {
+    /// The prepared bytes, `None`, said once on stderr, when the sweep is neither given nor derivable.
+    pub fn get(&self) -> Option<&bytes::Bytes> {
+        let prepare = || {
+            let sizes = match self.given.is_empty() {
+                false => Ok(self.given.clone()),
+                true => default_body_bytes(&self.interfaces),
+            };
+            let sizes = sizes.inspect_err(|message| eprintln!("downloads: {message}")).ok()?;
+            let largest = sizes.iter().copied().max()?;
+            Some(crate::payloads::context_body(self.seed, largest))
+        };
+        self.prepared.get_or_init(prepare).as_ref()
+    }
+}
+
+/// RFC 791's IPv4 header without options, RFC 8200's fixed IPv6 header, and RFC 9293's TCP header without options.
+const IPV4_HEADER_BYTES: u64 = 20;
+const IPV6_HEADER_BYTES: u64 = 40;
+const TCP_HEADER_BYTES: u64 = 20;
+/// The one upload size of the runs before the sweep, kept in the default sweep so new rows compare with theirs.
+pub const EARLIER_UPLOAD_BYTES: u64 = 256 << 10;
+/// RFC 7323's timestamps option, 10 bytes padded to 12, which Linux puts on every segment while
+/// `net.ipv4.tcp_timestamps` is on.
+const TCP_TIMESTAMPS_OPTION_BYTES: u64 = 12;
+
+/// Powers of 4 times the payload one TCP segment carries, from that payload up to `net.ipv4.tcp_rmem`'s maximum, the
+/// most one socket's receive buffer grows to, with `EARLIER_UPLOAD_BYTES` among them. The payload is the smallest MTU
+/// of the interfaces' devices, from `/sys/class/net/<device>/mtu`, less the IP and TCP headers and the timestamps
+/// option when it is on. An interface given as an address alone names the device holding that address, and a
+/// wildcard address every device.
+pub fn default_body_bytes(interfaces: &[Interface]) -> Result<Vec<u64>, String> {
+    let payloads = interfaces
+        .iter()
+        .map(segment_payload)
+        .collect::<Result<Vec<u64>, String>>()?;
+    let mut payload = payloads
+        .into_iter()
+        .min()
+        .ok_or("no interface is given; pass --body-bytes")?;
+    if read_setting("/proc/sys/net/ipv4/tcp_timestamps")?.trim() != "0" {
+        payload = payload.saturating_sub(TCP_TIMESTAMPS_OPTION_BYTES);
+    }
+    let receive_buffer = read_setting("/proc/sys/net/ipv4/tcp_rmem")?;
+    let largest: Option<u64> = receive_buffer
+        .split_whitespace()
+        .nth(2)
+        .and_then(|text| text.parse().ok());
+    let largest = largest.ok_or("/proc/sys/net/ipv4/tcp_rmem holds no maximum")?;
+    if payload == 0 {
+        return Err("the interfaces' MTU leaves no TCP payload; pass --body-bytes".into());
+    }
+    let powers = std::iter::successors(Some(payload), |&size| size.checked_mul(4));
+    let mut sizes: Vec<u64> = powers.take_while(|&size| size <= largest).collect();
+    if sizes.is_empty() {
+        sizes.push(payload);
+    }
+    if !sizes.contains(&EARLIER_UPLOAD_BYTES) {
+        sizes.push(EARLIER_UPLOAD_BYTES);
+        sizes.sort_unstable();
+    }
+    Ok(sizes)
+}
+
+fn read_setting(path: &str) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|error| format!("{path} is unreadable ({error}); pass --body-bytes"))
+}
+
+/// The smallest MTU among the interface's devices less its IP header and the TCP header, the MSS before options.
+fn segment_payload(interface: &Interface) -> Result<u64, String> {
+    let address = interface.addresses[0];
+    let devices = match &interface.device {
+        Some(device) => vec![device.clone()],
+        None => devices_of(address),
+    };
+    if devices.is_empty() {
+        return Err(format!(
+            "no device holds {address}, so its MTU is unknown; pass --body-bytes"
+        ));
+    }
+    let mut mtu = u64::MAX;
+    for device in devices {
+        let path = format!("/sys/class/net/{device}/mtu");
+        let text = read_setting(&path)?;
+        mtu = mtu.min(text.trim().parse().map_err(|_| format!("{path} holds no MTU"))?);
+    }
+    let ip_header = match address {
+        IpAddr::V4(_) => IPV4_HEADER_BYTES,
+        IpAddr::V6(_) => IPV6_HEADER_BYTES,
+    };
+    Ok(mtu.saturating_sub(ip_header + TCP_HEADER_BYTES))
+}
+
+/// Every device and address in the kernel's interface address list.
+#[cfg(target_os = "linux")]
+fn interface_addresses() -> Vec<(String, IpAddr)> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut entry = list;
+    // SAFETY: `getifaddrs` returned a list of valid entries, freed only below.
+    while let Some(current) = unsafe { entry.as_ref() } {
+        if let Some(address) = unsafe { address_of(current.ifa_addr) } {
+            let name = unsafe { std::ffi::CStr::from_ptr(current.ifa_name) };
+            found.push((name.to_string_lossy().into_owned(), address));
+        }
+        entry = current.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(list) };
+    found
+}
+
+#[cfg(not(target_os = "linux"))]
+fn interface_addresses() -> Vec<(String, IpAddr)> {
+    Vec::new()
+}
+
+/// The devices an address names: the one holding it, or every device holding an address for a wildcard, which
+/// listens on all of them.
+fn devices_of(address: IpAddr) -> Vec<String> {
+    let listed = interface_addresses().into_iter();
+    let mut devices: Vec<String> = match address.is_unspecified() {
+        true => listed.map(|(device, _)| device).collect(),
+        false => listed
+            .filter(|&(_, held)| held == address)
+            .map(|(device, _)| device)
+            .collect(),
+    };
+    devices.sort_unstable();
+    devices.dedup();
+    devices
+}
+
+/// The IP address a socket address holds, `None` for other families or no address.
+///
+/// # Safety
+/// `socket_address` is null or points to a socket address of the size its family implies.
+#[cfg(target_os = "linux")]
+unsafe fn address_of(socket_address: *const libc::sockaddr) -> Option<IpAddr> {
+    match i32::from(unsafe { socket_address.as_ref() }?.sa_family) {
+        libc::AF_INET => {
+            let ipv4 = unsafe { &*socket_address.cast::<libc::sockaddr_in>() };
+            Some(IpAddr::from(u32::from_be(ipv4.sin_addr.s_addr).to_be_bytes()))
+        }
+        libc::AF_INET6 => {
+            let ipv6 = unsafe { &*socket_address.cast::<libc::sockaddr_in6>() };
+            Some(IpAddr::from(ipv6.sin6_addr.s6_addr))
+        }
+        _ => None,
     }
 }
 
@@ -86,7 +283,7 @@ pub struct ClientArgs {
         env = "SERVEVAL_WORKLOADS",
         value_enum,
         value_delimiter = ',',
-        default_value = "tool,context,fanout"
+        default_value = "tool,context,download,fanout"
     )]
     pub workloads: Vec<Workload>,
     #[arg(
@@ -114,12 +311,11 @@ pub struct ClientArgs {
         default_value = "body"
     )]
     pub parsing: Vec<Parsing>,
-    /// Context upload sizes to sweep, like 256KB,4MB,64MB.
-    #[arg(long, env = "SERVEVAL_BODY_BYTES", value_delimiter = ',', default_value = "256KB", value_parser = parse_size_flag)]
-    pub body_bytes: Vec<u64>,
-    /// Calls outstanding at once, one per connection when unset.
-    #[arg(long, env = "SERVEVAL_IN_FLIGHT", value_parser = parse_count_flag)]
-    pub in_flight: Option<usize>,
+    #[command(flatten)]
+    pub body_bytes: BodyBytes,
+    /// Calls each connection keeps in flight to sweep, or server-maximum for the server's stream limit.
+    #[arg(long, env = "SERVEVAL_CALLS_IN_FLIGHT_PER_CONNECTION", value_delimiter = ',', default_value = "1", value_parser = parse_calls_in_flight_flag)]
+    pub calls_in_flight_per_connection: Vec<CallsInFlight>,
     /// Scheduled calls per second across this process; unset runs a closed loop.
     #[arg(long, env = "SERVEVAL_CALLS_PER_SECOND", value_parser = parse_count_flag)]
     pub calls_per_second: Option<usize>,
@@ -142,7 +338,73 @@ pub struct ClientArgs {
     pub output: PathBuf,
 }
 
-/// One measured configuration.
+/// `--calls-in-flight-per-connection` that reads the server's `max_concurrent_streams_per_connection` from `/health`.
+pub const SERVER_MAXIMUM: &str = "server-maximum";
+/// RFC 9113 section 5.1.2 recommends that a server's SETTINGS_MAX_CONCURRENT_STREAMS "be no smaller than 100", so a
+/// server advertising no limit gets the depth every conforming server allows.
+pub const RFC_9113_MINIMUM_CONCURRENT_STREAMS: usize = 100;
+/// Why a client that keeps one call in flight per connection cannot run a deeper configuration.
+pub const ONE_CALL_PER_CONNECTION: &str = "client keeps one call in flight per connection";
+/// Why a configuration the server answers 404, 405 or 501, or gRPC's `UNIMPLEMENTED`, cannot run.
+pub const NOT_SERVED: &str = "server does not serve this call";
+
+/// One `--calls-in-flight-per-connection` value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallsInFlight {
+    Count(NonZeroUsize),
+    /// The `max_concurrent_streams_per_connection` the server's `/health` advertises.
+    ServerMaximum,
+}
+
+impl fmt::Display for CallsInFlight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Count(count) => write!(formatter, "{count}"),
+            Self::ServerMaximum => formatter.write_str(SERVER_MAXIMUM),
+        }
+    }
+}
+
+/// Where a run's calls in flight per connection came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallsInFlightSource {
+    Flag,
+    ServerAdvertised,
+    /// The server advertises no limit, so the depth is `RFC_9113_MINIMUM_CONCURRENT_STREAMS`.
+    Rfc9113Minimum,
+}
+
+impl CallsInFlightSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::ServerAdvertised => "server-advertised",
+            Self::Rfc9113Minimum => "rfc9113-minimum",
+        }
+    }
+}
+
+/// The depth one connection carries and where the number came from: the flag, the server's advertised
+/// `max_concurrent_streams_per_connection`, or RFC 9113's recommended minimum when it advertises no limit.
+pub fn calls_in_flight_per_connection(
+    requested: CallsInFlight,
+    advertised: Option<u32>,
+) -> (usize, CallsInFlightSource) {
+    match (requested, advertised) {
+        (CallsInFlight::Count(count), _) => (count.get(), CallsInFlightSource::Flag),
+        (CallsInFlight::ServerMaximum, None) => {
+            (RFC_9113_MINIMUM_CONCURRENT_STREAMS, CallsInFlightSource::Rfc9113Minimum)
+        }
+        (CallsInFlight::ServerMaximum, Some(0)) => {
+            exit("the server advertises 0 concurrent streams per connection, so no call can run")
+        }
+        (CallsInFlight::ServerMaximum, Some(advertised)) => {
+            (advertised as usize, CallsInFlightSource::ServerAdvertised)
+        }
+    }
+}
+
+/// One configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct Run {
     pub workload: Workload,
@@ -151,25 +413,49 @@ pub struct Run {
     pub parsing: Parsing,
     pub phase: Phase,
     pub connections: usize,
+    pub calls_in_flight_per_connection: usize,
+    pub calls_in_flight_per_connection_source: CallsInFlightSource,
+    /// `connections` times `calls_in_flight_per_connection`.
     pub in_flight: usize,
-    /// Upload size of a context run, 0 for the others.
+    /// Body size of a context upload or download, 0 for the others.
     pub body_bytes: u64,
+    /// Why the client cannot run this configuration, `None` when it can.
+    pub unsupported: Option<&'static str>,
 }
 
+impl Run {
+    /// `throughput` when calls are amortized, by more than one in flight per connection or by server-side batching,
+    /// and `latency` otherwise.
+    pub fn test(&self) -> &'static str {
+        match self.calls_in_flight_per_connection > 1 || self.variant == Variant::Batched {
+            true => "throughput",
+            false => "latency",
+        }
+    }
+}
+
+/// Why a batched configuration has no measurement: the server ships no batching.
+pub const SERVER_DOES_NOT_BATCH: &str = "server does not batch calls";
+/// Why a batched upload has no measurement: uploads stream one body per call.
+pub const UPLOADS_NOT_BATCHED: &str = "uploads stream one body per call, so they are not batched";
+/// Why a batched download has no measurement: downloads stream one body per call.
+pub const DOWNLOADS_NOT_BATCHED: &str = "downloads stream one body per call, so they are not batched";
+
 impl ClientArgs {
-    /// Every configuration to measure; batched variants only where the server batches, and never for uploads.
-    /// Without multiplexing a connection carries one call at a time, so calls in flight stop at the connections.
-    pub fn runs(&self, batching: bool, multiplexed: bool) -> Vec<Run> {
+    /// Every configuration; batched variants only where the server batches, and never for uploads or downloads. A
+    /// client that does not multiplex keeps one call in flight per connection, so its deeper configurations are
+    /// `unsupported`.
+    pub fn runs(&self, batching: bool, multiplexed: bool, advertised: Option<u32>) -> Vec<Run> {
+        let depths: Vec<(usize, CallsInFlightSource)> = (self.calls_in_flight_per_connection.iter())
+            .map(|&requested| calls_in_flight_per_connection(requested, advertised))
+            .collect();
         let mut runs = Vec::new();
         for &workload in &self.workloads {
             let sizes = match workload {
-                Workload::Context => self.body_bytes.clone(),
+                Workload::Context | Workload::Download => self.body_bytes().to_vec(),
                 _ => vec![0],
             };
             for &variant in &self.variants {
-                if variant == Variant::Batched && (!batching || workload == Workload::Context) {
-                    continue;
-                }
                 let shapes = match (workload, variant) {
                     (Workload::Tool, Variant::Plain) => self.parsing.clone(),
                     _ => vec![Parsing::Body],
@@ -177,18 +463,25 @@ impl ClientArgs {
                 for &parsing in &shapes {
                     for &phase in &self.phases {
                         for &connections in &self.connections {
-                            let wanted = self.in_flight.unwrap_or(connections);
-                            let in_flight = if multiplexed { wanted } else { wanted.min(connections) };
-                            for &body_bytes in &sizes {
-                                runs.push(Run {
+                            for &(depth, source) in &depths {
+                                let unsupported = match (variant, workload) {
+                                    (Variant::Batched, Workload::Context) => Some(UPLOADS_NOT_BATCHED),
+                                    (Variant::Batched, Workload::Download) => Some(DOWNLOADS_NOT_BATCHED),
+                                    (Variant::Batched, _) if !batching => Some(SERVER_DOES_NOT_BATCH),
+                                    _ => (!multiplexed && depth != 1).then_some(ONE_CALL_PER_CONNECTION),
+                                };
+                                runs.extend(sizes.iter().map(|&body_bytes| Run {
                                     workload,
                                     variant,
                                     parsing,
                                     phase,
                                     connections,
-                                    in_flight,
+                                    calls_in_flight_per_connection: depth,
+                                    calls_in_flight_per_connection_source: source,
+                                    in_flight: connections * depth,
                                     body_bytes,
-                                });
+                                    unsupported,
+                                }));
                             }
                         }
                     }
@@ -196,6 +489,11 @@ impl ClientArgs {
             }
         }
         runs
+    }
+
+    /// The context upload and download sizes, `BodyBytes::sizes` of this client's interfaces.
+    pub fn body_bytes(&self) -> &[u64] {
+        self.body_bytes.sizes(&self.common.interfaces)
     }
 
     /// The local interface paired with target `index`, a single interface serving every target.
@@ -216,7 +514,10 @@ pub enum Security {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Workload {
     Tool,
+    /// `PUT /context` with `--body-bytes` seeded bytes, answered with their count.
     Context,
+    /// `GET /context?bytes=N`, answered with the first N seeded bytes of the context body.
+    Download,
     Fanout,
 }
 
@@ -598,6 +899,21 @@ pub fn parse_count_flag(text: &str) -> Result<usize, String> {
     parse_count(text).ok_or_else(|| "expected a positive count like 1000 or 10M".into())
 }
 
+/// Parses a positive count of calls each connection keeps in flight, or `server-maximum`.
+pub fn parse_calls_in_flight(text: &str) -> Option<CallsInFlight> {
+    match text {
+        SERVER_MAXIMUM => Some(CallsInFlight::ServerMaximum),
+        _ => parse_digits(text)
+            .and_then(|count| NonZeroUsize::new(usize::try_from(count).ok()?))
+            .map(CallsInFlight::Count),
+    }
+}
+
+/// `parse_calls_in_flight` for clap.
+pub fn parse_calls_in_flight_flag(text: &str) -> Result<CallsInFlight, String> {
+    parse_calls_in_flight(text).ok_or_else(|| format!("expected positive integers or {SERVER_MAXIMUM}"))
+}
+
 /// `parse_threads` for clap, with `0` resolved to every available core.
 pub fn parse_threads_flag(text: &str) -> Result<Threads, String> {
     parse_threads(text, Threads::all_cores().0).ok_or_else(|| "expected a count, 0 for all cores".into())
@@ -641,8 +957,44 @@ mod tests {
         assert_eq!(parse_size("64KB"), Some(65_536));
         assert_eq!(parse_duration("200ms"), Some(Duration::from_millis(200)));
         assert_eq!(parse_duration("2m"), None);
+        assert_eq!(
+            parse_calls_in_flight("server-maximum"),
+            Some(CallsInFlight::ServerMaximum)
+        );
+        assert_eq!(parse_calls_in_flight("0"), None);
+        assert_eq!(
+            calls_in_flight_per_connection(CallsInFlight::ServerMaximum, None),
+            (100, CallsInFlightSource::Rfc9113Minimum)
+        );
         let interface = parse_interface("ens5=10.0.1.16+10.0.1.17").unwrap();
         assert_eq!(interface.device.as_deref(), Some("ens5"));
         assert_eq!(interface.addresses.len(), 2);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn default_body_bytes_spans_one_segment_to_the_receive_buffer() {
+        let loopback = parse_interface("127.0.0.1").unwrap();
+        let sizes = default_body_bytes(&[loopback]).unwrap();
+        let mtu: u64 = std::fs::read_to_string("/sys/class/net/lo/mtu")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let timestamps = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_timestamps")
+            .unwrap()
+            .trim()
+            != "0";
+        let options = if timestamps { TCP_TIMESTAMPS_OPTION_BYTES } else { 0 };
+        assert_eq!(sizes[0], mtu - IPV4_HEADER_BYTES - TCP_HEADER_BYTES - options);
+        assert!(sizes.contains(&EARLIER_UPLOAD_BYTES));
+        let powers: Vec<u64> = (sizes.iter().copied())
+            .filter(|&size| size == sizes[0] || (size % sizes[0] == 0 && (size / sizes[0]).is_power_of_two()))
+            .collect();
+        assert!(powers.windows(2).all(|pair| pair[1] == pair[0] * 4));
+        let receive_buffer = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_rmem").unwrap();
+        let largest: u64 = receive_buffer.split_whitespace().nth(2).unwrap().parse().unwrap();
+        let last = *powers.last().unwrap();
+        assert!(powers.len() == 1 || (last <= largest && last * 4 > largest));
     }
 }

@@ -88,12 +88,29 @@ Clients compare every reply byte for byte with the one precomputed for its ring 
 Only plain tool calls sweep the shapes; context uploads, fan-out and the batched variants always send `body`.
 LitServe hands its API only the decoded body, so it supports `body` alone and reports `unsupported` for `raw` and `full`.
 
-Context uploads: `PUT /context` with 256KB, 4MB or 64MB of seeded bytes, answered with the byte count as 16 hexadecimal digits.
+Context uploads: `PUT /context` with `--body-bytes` seeded bytes, answered with the byte count as 16 hexadecimal digits.
+Context downloads: `GET /context?bytes=N`, answered with the first N of the same seeded bytes, from a buffer each server process prepares once, on its first download, for its largest `--body-bytes`.
+A download past that buffer gets 416, or `OUT_OF_RANGE` over gRPC, so servers and clients take the same sweep: a `launch.py` pair resolves the client's and hands it to both as `SERVEVAL_BODY_BYTES`.
+HTTP servers send the slice as one body the framework writes out as the socket drains; gRPC servers stream it as `Chunk` messages, which uploads stream in too.
+Each `Chunk` holds 4MB less 5 bytes: gRPC core's `GRPC_DEFAULT_MAX_RECV_MESSAGE_LENGTH` and tonic's `DEFAULT_MAX_RECV_MESSAGE_SIZE` are both 4MB, and the `data` field's tag and length varint take 1 and 4 of them, so a body crosses in as few messages as every default receiver takes.
+hyper, awc and tonic compare the reply chunk by chunk with the bytes they expect, which checks its length and every byte without gathering it.
+The UCall clients buffer the reply, capped at the largest download plus the head of the servers' reply to it, measured once from a streamed download of that size, and compare it whole, as the Python clients do.
+Uploads and downloads share the `--body-bytes` sweep.
+Unset, it runs powers of 4 from the payload of one TCP segment up to `net.ipv4.tcp_rmem`'s maximum, read on the machine running the flag, plus 256KB, the one upload size of the runs before the sweep, so new rows compare with theirs:
+
+- The segment's payload is the smallest MTU among the `--interfaces`, read from `/sys/class/net/<device>/mtu` for the named device, the one holding the address, or for a wildcard address every device.
+- From it come off the IPv4 header of RFC 791 or the IPv6 header of RFC 8200, and the TCP header of RFC 9293, 20 bytes without options, which leaves the MSS.
+- The 12 bytes of RFC 7323's timestamps option come off too while `net.ipv4.tcp_timestamps` is on, as Linux then sends it on every segment.
+- `net.ipv4.tcp_rmem`'s third field is the most one socket's receive buffer grows to, so the largest body fits one socket's buffer.
+
+At MTU 9001 with timestamps and a 32MB `tcp_rmem` maximum that is 8,949 bytes through 9,163,776 bytes in six steps besides 256KB, and over loopback's 65,536-byte MTU, 65,484 bytes upward.
 Agent fan-out: `POST /fanout?width=8` forwards the call to eight upstream `/tool` servers, checks each reply, and answers with 256 bytes.
 Batched variants go through `/tool/batch` and `/fanout/batch`, only where the framework ships its own batcher.
-A framework that would need a shim for a workload has no route for it, and its client prints `unsupported` for that configuration.
+A framework that would need a shim for a workload has no route for it, and its client writes an `unsupported` row for that configuration, naming the reason.
+LitServe has no context upload or download route, so those rows read "server does not serve this call".
 
 The gRPC pairs carry the same shapes through `serveval.proto`, padded to the same 1024 and 256 bytes: `Tool` for `body`, `Raw` for `raw`, and `Full` for `full`, with the token and `traceparent` as metadata entries.
+Uploads stream `Chunk` messages into `Context`, and downloads ask `Download` for a byte count and receive a stream of `Chunk` messages.
 `Full` answers a wrong token with `UNAUTHENTICATED` and a bad `traceparent` with `INVALID_ARGUMENT`.
 gRPC pairs use HTTP/2, multiplexing calls over one channel per connection, and their fan-out holds one channel per upstream.
 
@@ -112,6 +129,10 @@ TLS authenticates only the server, while Noise XX and IK authenticate both sides
 ## Placement
 
 `launch.py` knows binary paths, interfaces and layouts, never framework names.
+`--server-cores-per-network-interface N` gives a server N cores per interface: from the interface's memory domain, past its first `--housekeeping-cores-per-memory-domain` cores, inside the launcher's affinity mask, and without any core a network device's interrupt is pinned to, read from each device's MSI interrupts and `/proc/irq/<irq>/smp_affinity_list`.
+With `--server`, one launch runs a whole pair from the client box: for each cores value and each connection count it starts the server on `--server-host` over ssh, waits until every target accepts, runs the client once per `--client-passes` entry, and stops the server by closing the ssh session's input, so every server is sized for one count and one budget.
+A target that already accepts before its server starts fails that step, so no row measures a leftover server.
+`SERVEVAL_SERVER_CPU_LISTS`, like `8-11/104-107` with one list per interface, pins the server's cores instead of deriving them, as when interrupts move onto the serving cores; a pair then takes one cores value, which only names the budget its rows record.
 `--layout one` runs one process listing every interface, as UCall does.
 `--layout per-domain` runs one process per interface on its NIC's memory domain, as competitors do.
 Domains come from UCall's Python binding when it is importable, and are -1 otherwise.
@@ -153,11 +174,19 @@ The same tool calls swept over 64, 10K and 1M connections, from one loopback box
 
 ### Context Uploads
 
-`PUT /context` with 256KB, 4MB or 64MB of seeded bytes, answered with the byte count.
+`PUT /context` with `--body-bytes` seeded bytes, answered with the byte count.
 
 | Machine | Class | Framework | Client | Security | Phase | Connections | Body | Throughput | p50 | p99 | Server CPU | Date |
 | :------ | :---- | :-------- | :----- | :------- | :---- | ----------: | ---: | ---------: | --: | --: | ---------: | :--- |
 | -       | -     | -         | -      | -        | -     |           - |    - |          - |   - |   - |          - | -    |
+
+### Context Downloads
+
+`GET /context?bytes=N`, answered with N seeded bytes, with the server's Gbit/s per card in each direction.
+
+| Machine | Class | Framework | Client | Security | Phase | Connections | Body | Throughput | Gbit/s per card | p50 | p99 | Server CPU | Date |
+| :------ | :---- | :-------- | :----- | :------- | :---- | ----------: | ---: | ---------: | --------------: | --: | --: | ---------: | :--- |
+| -       | -     | -         | -      | -        | -     |           - |    - |          - |               - |   - |   - |          - | -    |
 
 ### Agent Fan-Out
 
@@ -178,7 +207,8 @@ The same tool calls swept over 64, 10K and 1M connections, from one loopback box
 ## CLI Reference
 
 Every server and client, in every language, takes the same flags.
-A value spelled `<…,...>` takes comma-separated values, and clients measure one configuration per combination.
+A value spelled `<…,...>` takes comma-separated values and runs one configuration per combination: clients sweep their own, and `launch.py` sweeps the server's.
+A combination a pair cannot run is still a row, with `unsupported` naming the reason and zeros where it would have measured, never a silent skip: batched uploads and downloads, a batched call to a server without a batcher, more calls in flight than a client multiplexes, or a route the server answers with 404, 405, 501 or gRPC's `UNIMPLEMENTED`.
 Counts read `64`, `10K` or `1M` in powers of 1000, sizes read `256KB` or `4MB` in powers of 1024, and durations read `200ms` or `10s`.
 Each client prints every setting at the start, as `- Name: value` in the same grammar the flag reads, then its cores and memory limit.
 A bad value prints `--flag="value" does not parse, expected …` and exits with status 1.
@@ -202,6 +232,9 @@ Servers and clients
   --seed <N>                            42
       Seed of every payload, or random.
 
+  --body-bytes <SIZE,...>               powers of 4 from one TCP segment's payload to tcp_rmem's maximum
+      Context upload and download sizes; a server prepares the largest once for its downloads.
+
 Servers
   --upstreams <ADDRESS:PORT,...>        none
       Fan-out targets.
@@ -213,15 +246,14 @@ Servers
 Clients
   --targets <ADDRESS,...>               127.0.0.1
       Server addresses, paired with --interfaces by position.
-  --workloads <WORKLOAD,...>            tool,context,fanout
+  --workloads <WORKLOAD,...>            tool,context,download,fanout
   --variants <VARIANT,...>              plain,batched
   --phases <PHASE,...>                  steady,handshake
   --parsing <SHAPE,...>                 body
       raw, body or full, swept only for plain tool calls.
-  --body-bytes <SIZE,...>               256KB
-      Context upload sizes.
-  --in-flight <N>                       one per connection
-      Calls outstanding at once.
+  --calls-in-flight-per-connection <N,...|server-maximum>   1
+      Calls each connection keeps outstanding, or the server's advertised stream or pipelining limit, RFC 9113's
+      minimum of 100 when it advertises none.
   --calls-per-second <N>                none
       Open-loop arrival rate; unset runs a closed loop.
   --width <N>                           8
@@ -236,6 +268,33 @@ Clients
       keep reuses the open connections across configurations; reconnect closes them and opens fresh ones for each.
   --output <DIR>                        results
       Directory for JSON reports.
+```
+
+`launch.py` takes the same `SERVEVAL_<FLAG>` defaults for its own flags:
+
+```text
+  --layout <LAYOUT>                     one
+      one, or per-domain for one process per interface on its NIC's memory domain.
+  --copies <N>                          1
+      Copies of a server on adjacent ports, for fan-out upstreams.
+  --port <PORT>                         SERVEVAL_PORT
+  --server-cores-per-network-interface <N,...>   none
+      Cores each server process gets per interface: the first N of the interface's memory domain past the
+      housekeeping cores, inside the launcher's affinity mask, pinned to no network device's interrupt. A server
+      launch takes one value; a pair sweeps several, relaunching the server for each.
+  --housekeeping-cores-per-memory-domain <N>     0
+      First cores of each memory domain left to the kernel, sshd and recorders.
+  --server <COMMAND>                    none
+      Makes the launch a pair: per cores value and connection count, a fresh server, the client after -- against
+      it once per pass, then the server stopped.
+  --server-host <SSH DESTINATION>       this box
+      Where the pair starts its server, through this launcher at the same path and Python.
+  --server-interfaces <INTERFACE,...>   the client's
+      The pair server's SERVEVAL_INTERFACES; a wildcard address stands for the devices holding the targets.
+  --client <PROGRAM,...>                the program after --
+      Clients to sweep against one listening server, each replacing the program before the flags after --.
+  --client-passes <FLAGS;...>           one pass
+      Extra client flags per pass, like "--variants plain --calls-in-flight-per-connection server-maximum".
 ```
 
 ## Output Format
@@ -280,11 +339,15 @@ The layout is schema version 2, which `scripts/plot.py` checks.
 `machine.budget` is the client's affinity mask and memory limit, and `server_budget` the servers' summed over the targets.
 `machine.kernel_limits` holds the sysctls that cap connection counts and socket memory, `null` where `/proc/sys` lacks one.
 `config.parsing` names the request shape, and is `body` for every workload but plain tool calls.
+`config.client` names the client program that measured the row, so a client driving another stack's server still names itself, and `config.framework` names the server from its `/health`.
+`config.batch_size` is the server's `--batch-size`, which `/health` reports as `batch_size`, null for a server that does not batch; it appears only in batched rows, so plain rows hash as they did before it was recorded.
 `window_unix_ms` is the measured window's first and last Unix millisecond, to line the row up with `scripts/record.sh` samples.
 `error_classes` splits `errors` into connect, refused, timeout, status and wrong reply, the last counting replies that differ from the expected bytes.
 `unsent` counts calls scheduled inside the window that never went out, and `send_lateness_us` how late the sent ones left against their intended send time.
 `client_cpu_share` is the client's CPU time as a share of its own cores, from 0 to 1.
 `client_limited` is true when under 99% of the offered rate went out, or when the p99 send lateness exceeds 5% of the p50 latency, so the row measured the client rather than the server.
+`server_busy_share` is the server's CPU per call times the window's calls per second, failed ones included, as a share of the serving cores: 1 means the rate kept every serving core busy.
+Well below 1, calls per second per server core is not the server's capacity: a client whose threads contend, too few calls in flight, or a lock the server sleeps on held it back, and `client_limited` cannot tell those apart.
 `request_body_bytes` and `response_body_bytes` count bodies only, without headers or framing, and `body_gigabytes_per_second` divides their sum by the window, printed as Body GB/s.
 `reconnects` counts the TCP connections the client's box opened over the window, warmup included, and `upstream_connections` those the server's box opened from before connecting to the end, like fan-out upstreams.
 Both read `ActiveOpens` from `/proc/net/snmp`, so they count TCP opens box-wide, any other process on the box included.
@@ -309,6 +372,9 @@ uv run scripts/plot.py results/ --output plots/
 ```
 
 The plotting script prints one Markdown table per workload, or with `--output` draws throughput and p99 latency against connections as SVG.
+With `--records`, each row carries `server_gigabits_per_second_received_per_network_interface` and `server_gigabits_per_second_transmitted_per_network_interface`, mapping every server card to its rate over the row's window, beside the full `network_interfaces` figures, and the tables show them as Gbit/s in and out per card.
+`--json-output` writes every row with those fields, like the `rows.json` of a run.
+A row with any failed call stays out of the figures and their numbers, listed as `errors: N` beside unsupported, void and client-limited rows.
 
 ## Project Layout
 

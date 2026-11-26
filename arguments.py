@@ -1,6 +1,7 @@
 """Flags shared by every Python server and client, each defaulting to its `SERVEVAL_<FLAG>` variable."""
 
 import argparse
+import ctypes
 import dataclasses
 import ipaddress
 import os
@@ -10,6 +11,8 @@ import sys
 import time
 from typing import NoReturn
 
+import payloads
+
 
 def exit(message: str) -> NoReturn:
     """Prints `message` and exits with 1."""
@@ -18,7 +21,7 @@ def exit(message: str) -> NoReturn:
 
 
 def add_flag(parser: argparse.ArgumentParser, flag: str, default, **options) -> None:
-    """Adds `flag`, defaulting to its `SERVEVAL_*` variable, the name the Rust and C++ pairs read."""
+    """Adds `flag`, defaulting to its `SERVEVAL_*` variable, the name the Rust pairs read."""
     variable = "SERVEVAL_" + flag.removeprefix("--").replace("-", "_").upper()
     parse = options.pop("type", str)
 
@@ -40,6 +43,11 @@ def parse_count(text: str) -> int:
     if not (digits.isascii() and digits.isdigit()) or suffix not in ("", "k", "m", "g", "t") or int(digits) == 0:
         raise ValueError("expected a positive count like 1000 or 10M")
     return int(digits) * 1000 ** ("", "k", "m", "g", "t").index(suffix)
+
+
+def parse_count_or_zero(text: str) -> int:
+    """A count like `parse_count`, or `0`."""
+    return 0 if text == "0" else parse_count(text)
 
 
 def parse_size(text: str) -> int:
@@ -148,6 +156,26 @@ def parse_upstream(text: str) -> tuple[str, int]:
     return parse_address(host.strip("[]")), parse_port(port)
 
 
+# The `--calls-in-flight-per-connection` that reads the server's `max_concurrent_streams_per_connection` from `/health`.
+SERVER_MAXIMUM = "server-maximum"
+# RFC 9113 section 5.1.2 recommends that a server's SETTINGS_MAX_CONCURRENT_STREAMS "be no smaller than 100", so a
+# server advertising no limit gets the depth every conforming server allows.
+RFC_9113_MINIMUM_CONCURRENT_STREAMS = 100
+# Why a client that keeps one call in flight per connection cannot run a deeper configuration.
+ONE_CALL_PER_CONNECTION = "client keeps one call in flight per connection"
+# Why a configuration the server answers 404, 405 or 501, or gRPC's UNIMPLEMENTED, cannot run.
+NOT_SERVED = "server does not serve this call"
+
+
+def parse_calls_in_flight(text: str) -> int | str:
+    """A positive count of calls each connection keeps in flight, or `server-maximum`."""
+    if text == SERVER_MAXIMUM:
+        return text
+    if not (text.isascii() and text.isdigit()) or int(text) == 0:
+        raise ValueError(f"expected positive integers or {SERVER_MAXIMUM}")
+    return int(text)
+
+
 def list_of(parse):
     """A comma-separated list of `parse` values."""
     return lambda text: [parse(item) for item in text.split(",")]
@@ -193,6 +221,138 @@ def _common(parser: argparse.ArgumentParser) -> None:
     add_flag(parser, "--seed", "42", type=parse_seed, help="Seed of every payload, or random to draw one.")
 
 
+def _body_bytes(parser: argparse.ArgumentParser) -> None:
+    add_flag(
+        parser,
+        "--body-bytes",
+        None,
+        type=list_of(parse_size),
+        help="Context upload and download sizes to sweep; unset, powers of 4 from one TCP segment's payload at the "
+        "interfaces' MTU up to net.ipv4.tcp_rmem's maximum.",
+    )
+
+
+# RFC 791's IPv4 header without options, RFC 8200's fixed IPv6 header, and RFC 9293's TCP header without options.
+IPV4_HEADER_BYTES, IPV6_HEADER_BYTES, TCP_HEADER_BYTES = 20, 40, 20
+# The one upload size of the runs before the sweep, kept in the default sweep so new rows compare with theirs.
+EARLIER_UPLOAD_BYTES = 256 << 10
+# RFC 7323's timestamps option, 10 bytes padded to 12, which Linux puts on every segment while
+# `net.ipv4.tcp_timestamps` is on.
+TCP_TIMESTAMPS_OPTION_BYTES = 12
+
+
+class _InterfaceAddresses(ctypes.Structure):
+    """One entry of the list `getifaddrs` returns, `struct ifaddrs` in <ifaddrs.h>."""
+
+
+_InterfaceAddresses._fields_ = [
+    ("next", ctypes.POINTER(_InterfaceAddresses)),
+    ("name", ctypes.c_char_p),
+    ("flags", ctypes.c_uint),
+    ("address", ctypes.c_void_p),
+    ("netmask", ctypes.c_void_p),
+    ("broadcast_or_destination", ctypes.c_void_p),
+    ("data", ctypes.c_void_p),
+]
+
+
+def _address_of(socket_address: int | None):
+    """The IP address a `struct sockaddr` holds, None for other families or no address. `struct sockaddr_in` keeps
+    the IPv4 address at byte 4, `struct sockaddr_in6` the IPv6 one at byte 8."""
+    family = ctypes.c_ushort.from_address(socket_address).value if socket_address else None
+    start, length = {socket.AF_INET: (4, 4), socket.AF_INET6: (8, 16)}.get(family, (0, 0))
+    return ipaddress.ip_address(ctypes.string_at(socket_address + start, length)) if length else None
+
+
+def interface_addresses() -> list[tuple[str, ipaddress.IPv4Address | ipaddress.IPv6Address]]:
+    """Every device and address in the kernel's interface address list."""
+    library = ctypes.CDLL(None, use_errno=True)
+    listed = ctypes.POINTER(_InterfaceAddresses)()
+    if library.getifaddrs(ctypes.byref(listed)) != 0:
+        return []
+    found, entry = [], listed
+    try:
+        while entry:
+            address = _address_of(entry.contents.address)
+            if address is not None:
+                found.append((entry.contents.name.decode(), address))
+            entry = entry.contents.next
+        return found
+    finally:
+        library.freeifaddrs(listed)
+
+
+def device_holding(address: str) -> str | None:
+    """The name of the device holding `address`, from the kernel's interface address list."""
+    wanted = ipaddress.ip_address(address)
+    return next((device for device, held in interface_addresses() if held == wanted), None)
+
+
+def devices_of(address: str) -> list[str]:
+    """The devices an address names: the one holding it, or every device holding an address for a wildcard, which
+    listens on all of them."""
+    wanted = ipaddress.ip_address(address)
+    listed = interface_addresses()
+    return sorted({device for device, held in listed if wanted.is_unspecified or held == wanted})
+
+
+def segment_payload(interface: Interface) -> int:
+    """The smallest MTU among the interface's devices less its IP header and the TCP header, the MSS before options."""
+    address = interface.addresses[0]
+    devices = [interface.device] if interface.device else devices_of(address)
+    if not devices:
+        raise ValueError(f"no device holds {address}, so its MTU is unknown")
+    mtu = min(int(pathlib.Path(f"/sys/class/net/{device}/mtu").read_text()) for device in devices)
+    header = IPV6_HEADER_BYTES if ":" in address else IPV4_HEADER_BYTES
+    return max(mtu - header - TCP_HEADER_BYTES, 0)
+
+
+def default_body_bytes(interfaces: list[Interface]) -> list[int]:
+    """Powers of 4 times the payload one TCP segment carries, from that payload up to `net.ipv4.tcp_rmem`'s maximum,
+    the most one socket's receive buffer grows to, with `EARLIER_UPLOAD_BYTES` among them. The payload is the smallest
+    MTU of the interfaces' devices, from `/sys/class/net/<device>/mtu`, less the IP and TCP headers and the timestamps
+    option when it is on. An interface given as an address alone names the device holding that address, and a wildcard
+    address every device."""
+    payload = min(segment_payload(interface) for interface in interfaces)
+    if pathlib.Path("/proc/sys/net/ipv4/tcp_timestamps").read_text().strip() != "0":
+        payload = max(payload - TCP_TIMESTAMPS_OPTION_BYTES, 0)
+    largest = int(pathlib.Path("/proc/sys/net/ipv4/tcp_rmem").read_text().split()[2])
+    if payload == 0:
+        raise ValueError("the interfaces' MTU leaves no TCP payload")
+    sizes = [payload]
+    while sizes[-1] * 4 <= largest:
+        sizes.append(sizes[-1] * 4)
+    return sorted({*sizes, EARLIER_UPLOAD_BYTES})
+
+
+def body_bytes(args: argparse.Namespace) -> list[int]:
+    """The `--body-bytes` sizes, or `default_body_bytes` of the interfaces, derived on first use; exits when they
+    cannot be."""
+    if args.body_bytes is None:
+        try:
+            args.body_bytes = default_body_bytes(args.interfaces)
+        except (OSError, ValueError, IndexError) as error:
+            exit(f"{error}; pass --body-bytes")
+    return args.body_bytes
+
+
+_prepared: dict[str, bytes | None] = {}
+
+
+def download_body(args: argparse.Namespace) -> bytes | None:
+    """The bytes every download is a prefix of, for the largest `--body-bytes` of this server's interfaces, prepared
+    on the first download, so a server that never serves one never derives the sweep; None, said once on stderr,
+    when the sweep is neither given nor derivable."""
+    if "body" not in _prepared:
+        try:
+            sizes = args.body_bytes or default_body_bytes(args.interfaces)
+        except (OSError, ValueError, IndexError) as error:
+            print(f"downloads: {error}", file=sys.stderr)
+            sizes = None
+        _prepared["body"] = payloads.context_body(args.seed, max(sizes)) if sizes else None
+    return _prepared["body"]
+
+
 def server_parser(description: str) -> argparse.ArgumentParser:
     """The flags every Python server takes."""
     parser = argparse.ArgumentParser(description=description)
@@ -207,6 +367,7 @@ def server_parser(description: str) -> argparse.ArgumentParser:
     add_flag(parser, "--upstreams", None, type=list_of(parse_upstream), help="Fan-out targets as ADDRESS:PORT.")
     add_flag(parser, "--batch-size", "32", type=parse_count, help="Most calls one batch gathers.")
     add_flag(parser, "--batch-wait", "10ms", type=parse_duration, help="Longest a batch waits to fill.")
+    _body_bytes(parser)
     return parser
 
 
@@ -222,7 +383,13 @@ def client_parser(description: str) -> argparse.ArgumentParser:
         help="Server addresses, paired with --interfaces by position.",
     )
     add_flag(parser, "--connections", "64", type=list_of(parse_count), help="Connection counts to sweep.")
-    add_flag(parser, "--workloads", "tool,context,fanout", type=one_of("tool", "context", "fanout"), help="Workloads.")
+    add_flag(
+        parser,
+        "--workloads",
+        "tool,context,download,fanout",
+        type=one_of("tool", "context", "download", "fanout"),
+        help="Workloads.",
+    )
     add_flag(parser, "--variants", "plain,batched", type=one_of("plain", "batched"), help="Variants.")
     add_flag(parser, "--phases", "steady,handshake", type=one_of("steady", "handshake"), help="Connection phases.")
     add_flag(
@@ -232,9 +399,13 @@ def client_parser(description: str) -> argparse.ArgumentParser:
         type=one_of("raw", "body", "full"),
         help="Tool call shapes: raw bytes, a typed body, or a typed body with path, query and header values.",
     )
-    add_flag(parser, "--body-bytes", "256KB", type=list_of(parse_size), help="Context upload sizes to sweep.")
+    _body_bytes(parser)
     add_flag(
-        parser, "--in-flight", None, type=parse_count, help="Calls outstanding at once, one per connection when unset."
+        parser,
+        "--calls-in-flight-per-connection",
+        "1",
+        type=list_of(parse_calls_in_flight),
+        help=f"Calls each connection keeps in flight to sweep, or {SERVER_MAXIMUM} for the server's stream limit.",
     )
     add_flag(
         parser, "--calls-per-second", None, type=parse_count, help="Scheduled calls per second; unset is closed-loop."
@@ -280,34 +451,87 @@ def single_interface(args: argparse.Namespace, framework: str) -> Interface:
 
 @dataclasses.dataclass(frozen=True)
 class Run:
-    """One measured configuration; `parsing` is swept only for plain tool calls, `body` for every other run."""
+    """One configuration; `parsing` is swept only for plain tool calls, `body` for every other run. `in_flight` is
+    `connections` times `calls_in_flight_per_connection`, whose `_source` is `flag`, `server-advertised` or
+    `rfc9113-minimum`, and `unsupported` names why the client cannot run it, None when it can."""
 
     workload: str
     variant: str
     parsing: str
     phase: str
     connections: int
+    calls_in_flight_per_connection: int
+    calls_in_flight_per_connection_source: str
     in_flight: int
     body_bytes: int
+    unsupported: str | None
+
+    @property
+    def test(self) -> str:
+        """`throughput` when calls are amortized, by more than one in flight per connection or by server-side batching,
+        and `latency` otherwise."""
+        amortized = self.calls_in_flight_per_connection > 1 or self.variant == "batched"
+        return "throughput" if amortized else "latency"
 
 
-def runs(args: argparse.Namespace, batching: bool, multiplexed: bool) -> list[Run]:
-    """Every configuration; batched variants only where the server batches, and never for uploads."""
+# Why a batched configuration has no measurement: the server ships no batching, or uploads and downloads stream one
+# body per call.
+SERVER_DOES_NOT_BATCH = "server does not batch calls"
+UPLOADS_NOT_BATCHED = "uploads stream one body per call, so they are not batched"
+DOWNLOADS_NOT_BATCHED = "downloads stream one body per call, so they are not batched"
+
+
+def calls_in_flight_per_connection(requested: int | str, advertised: int | None) -> tuple[int, str]:
+    """The depth one connection carries and where the number came from: the flag, the server's advertised
+    `max_concurrent_streams_per_connection`, or RFC 9113's recommended minimum when it advertises no limit."""
+    if requested != SERVER_MAXIMUM:
+        return requested, "flag"
+    if advertised is None:
+        return RFC_9113_MINIMUM_CONCURRENT_STREAMS, "rfc9113-minimum"
+    if advertised == 0:
+        exit("the server advertises 0 concurrent streams per connection, so no call can run")
+    return advertised, "server-advertised"
+
+
+def runs(args: argparse.Namespace, batching: bool, multiplexed: bool, advertised: int | None) -> list[Run]:
+    """Every configuration; batched variants only where the server batches, and never for uploads or downloads. A
+    client that does not multiplex keeps one call in flight per connection, so its deeper configurations are
+    `unsupported`."""
+    depths = [
+        calls_in_flight_per_connection(requested, advertised) for requested in args.calls_in_flight_per_connection
+    ]
     result = []
     for workload in args.workloads:
-        sizes = args.body_bytes if workload == "context" else [0]
+        sizes = body_bytes(args) if workload in ("context", "download") else [0]
         for variant in args.variants:
-            if variant == "batched" and (not batching or workload == "context"):
-                continue
             shapes = args.parsing if (workload, variant) == ("tool", "plain") else ["body"]
             for parsing in shapes:
                 for phase in args.phases:
                     for connections in args.connections:
-                        wanted = args.in_flight or connections
-                        in_flight = wanted if multiplexed else min(wanted, connections)
-                        result += [
-                            Run(workload, variant, parsing, phase, connections, in_flight, size) for size in sizes
-                        ]
+                        for depth, source in depths:
+                            unsupported = None if multiplexed or depth == 1 else ONE_CALL_PER_CONNECTION
+                            if variant == "batched" and workload == "context":
+                                unsupported = UPLOADS_NOT_BATCHED
+                            elif variant == "batched" and workload == "download":
+                                unsupported = DOWNLOADS_NOT_BATCHED
+                            elif variant == "batched" and not batching:
+                                unsupported = SERVER_DOES_NOT_BATCH
+                            in_flight = connections * depth
+                            result += [
+                                Run(
+                                    workload,
+                                    variant,
+                                    parsing,
+                                    phase,
+                                    connections,
+                                    depth,
+                                    source,
+                                    in_flight,
+                                    size,
+                                    unsupported,
+                                )
+                                for size in sizes
+                            ]
     return result
 
 

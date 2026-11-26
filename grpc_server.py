@@ -1,4 +1,5 @@
-"""Python's asynchronous gRPC serving the tool, context and fan-out workloads, one so_reuseport process per thread.
+"""Python's asynchronous gRPC serving the tool, context, download and fan-out workloads, one so_reuseport process per
+thread.
 
 gRPC binds by address alone, so it cannot pin a device.
 """
@@ -51,6 +52,8 @@ class Agent(services.AgentServicer):
             for upstream in args.upstreams or []
         ]
         self.upstreams = [services.AgentStub(channel) for channel in channels]
+        # The prepared download body as the messages that stream it, made on the first download.
+        self.chunks = []
 
     async def Tool(self, request, context):
         return reply(request)
@@ -73,6 +76,25 @@ class Agent(services.AgentServicer):
             count += len(chunk.data)
         return protos.Count(bytes=count)
 
+    async def Download(self, request, context):
+        """Streams the chunks of the body this process prepares on its first download that cover the first `bytes`
+        bytes, the last one cut to fit."""
+        prepared = arguments.download_body(args)
+        if prepared is None:
+            await context.abort(grpc.StatusCode.INTERNAL, "the server prepared no download body")
+        if request.bytes > len(prepared):
+            await context.abort(grpc.StatusCode.OUT_OF_RANGE, "the server prepared fewer download bytes")
+        if not self.chunks:
+            self.chunks = [
+                protos.Chunk(data=prepared[offset : offset + payloads.CHUNK_BYTES])
+                for offset in range(0, len(prepared), payloads.CHUNK_BYTES)
+            ]
+        whole, rest = divmod(request.bytes, payloads.CHUNK_BYTES)
+        for chunk in self.chunks[:whole]:
+            yield chunk
+        if rest:
+            yield protos.Chunk(data=prepared[whole * payloads.CHUNK_BYTES : request.bytes])
+
     async def Fanout(self, request, context):
         width = dict(context.invocation_metadata()).get("width", "")
         if not (width.isascii() and width.isdigit()):
@@ -87,10 +109,17 @@ class Agent(services.AgentServicer):
         return expected
 
     async def Health(self, request, context):
+        # `HealthReply` has no field for the stream limit, so it travels as metadata, left out for no limit: the
+        # `grpc.max_concurrent_streams` channel option the server is built with, which these options do not set.
+        streams = dict(OPTIONS).get("grpc.max_concurrent_streams")
+        if streams is not None:
+            await context.send_initial_metadata(((payloads.MAX_CONCURRENT_STREAMS_METADATA, str(streams)),))
         return protos.HealthReply(framework="grpc", client="grpc.aio", batching=False)
 
     async def Stats(self, request, context):
-        return protos.StatsReply(**{key: value for key, value in stats.unit_stats().items() if value is not None})
+        fields, metadata = stats.grpc_reply(stats.unit_stats())
+        await context.send_initial_metadata(metadata)
+        return protos.StatsReply(**fields)
 
 
 async def serve() -> None:

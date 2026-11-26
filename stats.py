@@ -4,11 +4,11 @@ import asyncio
 import dataclasses
 import json
 import math
+import os
 import pathlib
 import resource
+import threading
 import time
-
-import arguments
 
 SUB_BINS = 16
 EXACT_BITS = 5
@@ -212,14 +212,102 @@ def settled(earlier: tuple, later: tuple) -> bool:
     return sockets == later_sockets and abs(later_memory - memory) * 100 <= memory
 
 
+def parse_cpus(text: str) -> list[int]:
+    """The cores of a cpuset list like `8-9,104-105`, in order; a malformed range is skipped."""
+    cpus = []
+    for part in filter(None, text.strip().split(",")):
+        first, _, last = part.partition("-")
+        last = last or first
+        if first.isascii() and first.isdigit() and last.isascii() and last.isdigit():
+            cpus += range(int(first), int(last) + 1)
+    return cpus
+
+
+def spell_cpus(cpus) -> str:
+    """Spells cores as a cpuset list like `8-9,104-105`, the way `parse_cpus` reads it."""
+    ranges, ordered = [], sorted(set(cpus))
+    for index, cpu in enumerate(ordered):
+        if index == 0 or ordered[index - 1] != cpu - 1:
+            ranges.append([cpu, cpu])
+        else:
+            ranges[-1][1] = cpu
+    return ",".join(f"{first}-{last}" if last != first else f"{first}" for first, last in ranges)
+
+
+def allowed_cpus() -> list[int]:
+    """The cores this process may run on: its `sched_getaffinity` mask, or every core where the platform has none."""
+    if not hasattr(os, "sched_getaffinity"):
+        return list(range(os.cpu_count() or 1))
+    return sorted(os.sched_getaffinity(0))
+
+
+def unit_name() -> str | None:
+    """This process's systemd unit, the last component of its cgroup v2 path like
+    `serveval-server-axum-8545-0.service`, or None outside a cgroup v2 hierarchy or at its root."""
+    directory = _cgroup_directory()
+    return None if directory is None or directory == pathlib.Path("/sys/fs/cgroup") else directory.name
+
+
+class MemoryPeak:
+    """The cgroup's `memory.peak` since the previous read, through one descriptor this process holds open.
+
+    Writing to an open `memory.peak` resets the peak only that descriptor reports, to the current usage, which Linux
+    allows since 6.12; so a client's `/stats` before and after its window bracket that window's peak. The descriptor
+    opens on the first read and again on every read until it opens: `memory.peak` belongs to root unless the launcher
+    hands it to the server's user, and a peak that cannot be reset would cover the unit's whole life, so it reads as
+    None instead. A process with several workers holds one descriptor per worker, and a reply covers the time since
+    the answering worker's previous `/stats`."""
+
+    def __init__(self) -> None:
+        self.descriptor: int | None = None
+        # Two `/stats` replies served at once must not interleave one's read with the other's reset.
+        self.lock = threading.Lock()
+
+    def take(self) -> int | None:
+        """The peak since the previous `take`, or since the cgroup started for the first, then resets it."""
+        with self.lock:
+            directory = _cgroup_directory()
+            if self.descriptor is None and directory is not None:
+                try:
+                    self.descriptor = os.open(directory / "memory.peak", os.O_RDWR | os.O_CLOEXEC)
+                except OSError:
+                    return None
+            if self.descriptor is None:
+                return None
+            try:
+                peak = int(os.pread(self.descriptor, 32, 0))
+                # The kernel takes any non-empty write as a reset and ignores the offset.
+                os.pwrite(self.descriptor, b"reset\n", 0)
+            except (OSError, ValueError):
+                return None
+            return peak
+
+
+memory_peak = MemoryPeak()
+
+
 def unit_stats() -> dict:
-    """This process's cgroup v2 counters, covering every worker process, None where there is no cgroup v2, and the
-    box's `tcp_active_opens`."""
+    """The `/stats` reply: this process's cgroup v2 counters, which cover every process of its systemd unit, with the
+    unit's cores and the box's `tcp_active_opens`. Each server runs in its own unit, so a reply covers one server.
+
+    - `cpu_microseconds`: the cgroup's `usage_usec` from `cpu.stat`.
+    - `memory_current_bytes`: the cgroup's `memory.current`.
+    - `memory_peak_bytes`: the cgroup's `memory.peak` since the previous `/stats`, as `MemoryPeak` reads it.
+    - `memory_limit`: the smallest `memory.max` of the cgroup and its ancestors.
+    - `cores` and `cpu_list`: the `sched_getaffinity` mask, counted and spelled like `8-9`.
+    - `unit`: the cgroup's last path component, like `serveval-server-axum-8545-0.service`.
+    - `tcp_active_opens`: TCP connections the box opened since boot, every process together.
+
+    A counter is None where its file is missing, as outside a cgroup v2 hierarchy."""
+    cpus = allowed_cpus()
     stats = {
         "cpu_microseconds": None,
-        "memory_bytes": None,
-        "cores": arguments.all_cores(),
+        "memory_current_bytes": None,
+        "memory_peak_bytes": memory_peak.take(),
         "memory_limit": None,
+        "cores": len(cpus),
+        "cpu_list": spell_cpus(cpus),
+        "unit": unit_name(),
         "tcp_active_opens": tcp_active_opens(),
     }
     directory = _cgroup_directory()
@@ -227,7 +315,7 @@ def unit_stats() -> dict:
         return stats
     limits = [_read_integer(ancestor / "memory.max") for ancestor in (directory, *directory.parents)]
     stats["cpu_microseconds"] = _read_integer(directory / "cpu.stat", "usage_usec ")
-    stats["memory_bytes"] = _read_integer(directory / "memory.current")
+    stats["memory_current_bytes"] = _read_integer(directory / "memory.current")
     stats["memory_limit"] = min((limit for limit in limits if limit is not None), default=None)
     return stats
 
@@ -235,6 +323,98 @@ def unit_stats() -> dict:
 def unit_json() -> bytes:
     """The `/stats` body."""
     return json.dumps(unit_stats(), separators=(",", ":")).encode()
+
+
+# The `/stats` fields `serveval.proto`'s `StatsReply` has no field for, which the gRPC pairs send as response metadata,
+# each under its name with dashes for underscores.
+METADATA_FIELDS = ("memory_peak_bytes", "cpu_list", "unit")
+
+
+def grpc_reply(stats: dict) -> tuple[dict, tuple[tuple[str, str], ...]]:
+    """The gRPC `Stats` reply of `unit_stats()`: the `StatsReply` fields, whose `memory_bytes` carries
+    `memory_current_bytes`, and the metadata holding the fields it lacks."""
+    fields = {"memory_bytes": stats["memory_current_bytes"]}
+    fields |= {key: stats[key] for key in ("cpu_microseconds", "cores", "memory_limit", "tcp_active_opens")}
+    metadata = tuple((key.replace("_", "-"), str(stats[key])) for key in METADATA_FIELDS if stats[key] is not None)
+    return {key: value for key, value in fields.items() if value is not None}, metadata
+
+
+def from_grpc_reply(reply, metadata) -> dict:
+    """Reads a reply `grpc_reply` made; a field missing from it reads as None."""
+    entries = dict(metadata or ())
+
+    def field(name: str):
+        return getattr(reply, name) if reply.HasField(name) else None
+
+    peak = entries.get("memory-peak-bytes", "")
+    return {
+        "cpu_microseconds": field("cpu_microseconds"),
+        "memory_current_bytes": field("memory_bytes"),
+        "memory_peak_bytes": int(peak) if peak.isascii() and peak.isdigit() else None,
+        "memory_limit": field("memory_limit"),
+        "cores": reply.cores,
+        "cpu_list": entries.get("cpu-list", ""),
+        "unit": entries.get("unit"),
+        "tcp_active_opens": field("tcp_active_opens"),
+    }
+
+
+def server_stats(replies: list[dict]) -> dict:
+    """The `/stats` replies of every target as one server's: counters summed, `cpu_list` unioned, and `units` listing
+    each unit once. A unit serving several targets, like UCall's one server on both network interfaces, answers each
+    alike, so only its first reply counts: a second would count its cores twice and see its memory peak just reset.
+    A counter missing from any counted reply is None, and `tcp_active_opens`, the box's, is the largest."""
+    counted, units = [], []
+    for reply in replies:
+        unit = reply.get("unit")
+        if unit is not None and unit in units:
+            continue
+        counted.append(reply)
+        if unit is not None:
+            units.append(unit)
+
+    def total(key: str) -> int | None:
+        values = [reply.get(key) for reply in counted]
+        return None if None in values else sum(values)
+
+    opens = [reply.get("tcp_active_opens") for reply in replies]
+    return {
+        "cpu_microseconds": total("cpu_microseconds"),
+        "memory_current_bytes": total("memory_current_bytes"),
+        "memory_peak_bytes": total("memory_peak_bytes"),
+        "memory_limit": total("memory_limit"),
+        "cores": sum(reply.get("cores") or 0 for reply in counted),
+        "cpu_list": spell_cpus(cpu for reply in counted for cpu in parse_cpus(reply.get("cpu_list") or "")),
+        "units": units,
+        "tcp_active_opens": None if None in opens else max(opens, default=None),
+        "event_loop_counters": summed_counters([reply.get("event_loop_counters") for reply in counted]),
+    }
+
+
+def summed_counters(all_counters: list[dict | None]) -> dict | None:
+    """Event-loop counters summed by name, None unless every entry keeps them."""
+    if not all_counters or None in all_counters:
+        return None
+    sums: dict[str, int] = {}
+    for counters in all_counters:
+        for name, value in counters.items():
+            sums[name] = sums.get(name, 0) + value
+    return sums
+
+
+def counter_growth(before: dict | None, after: dict | None) -> dict | None:
+    """Each event-loop counter's growth from `before` to `after`, one server's counters sampled around a window."""
+    if before is None or after is None:
+        return None
+    return {name: max(value - before.get(name, 0), 0) for name, value in after.items()}
+
+
+def per_request(growth: dict | None) -> dict | None:
+    """Each nonzero counter of `growth` per request the loops parsed over the same span; None without requests."""
+    requests = (growth or {}).get("requests", 0)
+    if not requests:
+        return None
+    return {name: value / requests for name, value in growth.items() if value}
 
 
 def process_cpu() -> float:

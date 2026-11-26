@@ -15,10 +15,10 @@ use serveval::{
     payloads::{self, Exchange, ToolParts},
     results::{Pair, Report, Sample},
     security,
-    stats::{self, Failure, Slot, Tally, UnitStats, Window},
+    stats::{self, Failure, ServerStats, Slot, Tally, UnitStats, Window},
 };
 
-/// hyper driving an HTTP server through the tool, context and fan-out workloads.
+/// hyper driving an HTTP server through the tool, context, download and fan-out workloads.
 #[derive(clap::Parser)]
 #[command(about)]
 struct Cli {
@@ -36,11 +36,12 @@ struct Shared {
     ring: Vec<ToolParts>,
 }
 
-/// One configuration's calls: the context upload, or one exchange per ring entry.
+/// One configuration's calls: the context upload or download, or one exchange per ring entry.
 struct Load {
     shared: Arc<Shared>,
     run: Run,
     exchanges: Vec<Exchange>,
+    /// The body a context upload sends, or a download must get back.
     context: Bytes,
 }
 
@@ -64,6 +65,24 @@ async fn exchange(sender: &mut Sender, request: Request<Full<Bytes>>) -> Result<
     ))
 }
 
+/// Sends a download and compares its reply frame by frame with `expected`, returning the bytes received.
+async fn download(sender: &mut Sender, request: Request<Full<Bytes>>, expected: &[u8]) -> Result<u64, Failure> {
+    let failure = |error: hyper::Error| Failure::of(&error);
+    sender.ready().await.map_err(failure)?;
+    let response = sender.send_request(request).await.map_err(failure)?;
+    if response.status() != StatusCode::OK {
+        return Err(Failure::Status);
+    }
+    let mut body = response.into_body();
+    let mut check = payloads::DownloadCheck::new(expected);
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.map_err(failure)?.into_data() {
+            check.chunk(&data);
+        }
+    }
+    check.matched().ok_or(Failure::WrongReply)
+}
+
 /// The request of call `sequence`, its body's length, and the reply it must get back.
 fn request(load: &Load, target: usize, sequence: usize) -> (Request<Full<Bytes>>, u64, Bytes) {
     let mut builder = Request::builder()
@@ -78,6 +97,12 @@ fn request(load: &Load, target: usize, sequence: usize) -> (Request<Full<Bytes>>
             builder = builder.method(Method::PUT).uri("/context");
             let reply = payloads::count_reply(load.context.len() as u64);
             (load.context.clone(), Bytes::from(reply))
+        }
+        Workload::Download => {
+            builder = builder
+                .method(Method::GET)
+                .uri(payloads::download_path(load.context.len() as u64));
+            (Bytes::new(), load.context.clone())
         }
         _ => {
             let exchange = &load.exchanges[sequence % payloads::RING];
@@ -101,6 +126,9 @@ fn request(load: &Load, target: usize, sequence: usize) -> (Request<Full<Bytes>>
 /// One verified call: the body bytes sent and received, or why it failed.
 async fn call(load: &Load, sender: &mut Sender, target: usize, sequence: usize) -> Result<(u64, u64), Failure> {
     let (request, sent, expected) = request(load, target, sequence);
+    if load.run.workload == Workload::Download {
+        return Ok((sent, download(sender, request, &expected).await?));
+    }
     let (status, reply) = exchange(sender, request).await?;
     match (status == StatusCode::OK, reply == expected) {
         (false, _) => Err(Failure::Status),
@@ -118,7 +146,7 @@ async fn get(shared: &Shared, target: usize, path: &str) -> Option<Bytes> {
     (status == StatusCode::OK).then_some(reply)
 }
 
-async fn server_stats(shared: &Shared) -> UnitStats {
+async fn server_stats(shared: &Shared) -> ServerStats {
     let mut all = Vec::new();
     for target in 0..shared.targets.len() {
         let reply = get(shared, target, "/stats").await;
@@ -199,18 +227,26 @@ async fn measure(args: ClientArgs) -> io::Result<()> {
     let health = get(&shared, 0, "/health")
         .await
         .ok_or_else(|| io::Error::other("no /health reply"))?;
-    let pair: Pair = serde_json::from_slice(&health)?;
-    let runs = args.runs(pair.batching, false);
+    // The row names this client, not the one `/health` names for the server's own pair.
+    let pair = Pair {
+        client: "hyper".into(),
+        ..serde_json::from_slice(&health)?
+    };
+    let runs = args.runs(pair.batching, false, pair.max_concurrent_streams_per_connection);
     let mut report = Report::new(args, pair);
     let targets = shared.targets.len();
     let mut kept: Vec<Vec<Sender>> = (0..targets).map(|_| Vec::new()).collect();
     for (number, run) in runs.into_iter().enumerate() {
+        if let Some(reason) = run.unsupported {
+            report.unsupported(args, &run, reason)?;
+            continue;
+        }
         let context = match run.workload {
-            Workload::Context => payloads::context_body(args.common.seed.into(), run.body_bytes),
+            Workload::Context | Workload::Download => payloads::context_body(args.common.seed.into(), run.body_bytes),
             _ => Bytes::new(),
         };
         let exchanges = match run.workload {
-            Workload::Context => Vec::new(),
+            Workload::Context | Workload::Download => Vec::new(),
             _ => payloads::exchanges(&shared.ring, &run, args.width),
         };
         let load = Arc::new(Load {
@@ -227,7 +263,7 @@ async fn measure(args: ClientArgs) -> io::Result<()> {
             Err(_) => None,
         };
         if let Some(StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED) = probe {
-            report.unsupported(&run);
+            report.unsupported(args, &run, arguments::NOT_SERVED)?;
             continue;
         }
         let server_before = server_stats(&shared).await;
@@ -266,10 +302,16 @@ async fn measure(args: ClientArgs) -> io::Result<()> {
         report.add(args, &run, &window, &tally, &sample)?;
         if args.between_runs == BetweenRuns::Reconnect {
             kept.iter_mut().for_each(Vec::clear);
-            let mut earlier = (stats::sockets_in_use(), server_stats(&shared).await.memory_bytes);
+            let mut earlier = (
+                stats::sockets_in_use(),
+                server_stats(&shared).await.memory_current_bytes,
+            );
             for _ in 0..stats::SETTLE_ROUNDS {
                 tokio::time::sleep(stats::SETTLE_INTERVAL).await;
-                let later = (stats::sockets_in_use(), server_stats(&shared).await.memory_bytes);
+                let later = (
+                    stats::sockets_in_use(),
+                    server_stats(&shared).await.memory_current_bytes,
+                );
                 if stats::settled(earlier, later) {
                     break;
                 }

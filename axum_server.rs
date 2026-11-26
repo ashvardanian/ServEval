@@ -19,14 +19,14 @@ use hyper_util::{
 };
 
 use serveval::{
-    arguments::{self, Security, ServerArgs},
+    arguments::{self, DownloadBody, Security, ServerArgs},
     payloads, security, stats,
 };
 
 const JSON: [(header::HeaderName, &str); 1] = [(header::CONTENT_TYPE, payloads::JSON)];
 const OCTETS: [(header::HeaderName, &str); 1] = [(header::CONTENT_TYPE, payloads::OCTETS)];
 
-/// axum serving the tool, context and fan-out workloads.
+/// axum serving the tool, context, download and fan-out workloads.
 #[derive(clap::Parser)]
 #[command(about)]
 struct Cli {
@@ -106,6 +106,14 @@ async fn context(body: Body) -> Result<String, StatusCode> {
     Ok(payloads::count_reply(bytes))
 }
 
+/// The first `bytes` bytes of the prepared download body, sent as one body hyper writes as the socket drains; 416 when
+/// the server prepared fewer, 500 when it could not prepare any.
+fn download(prepared: &DownloadBody, query: payloads::DownloadQuery) -> Result<impl IntoResponse, StatusCode> {
+    let prepared = prepared.get().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let body = payloads::download(prepared, query.bytes).ok_or(StatusCode::RANGE_NOT_SATISFIABLE)?;
+    Ok((OCTETS, body))
+}
+
 async fn fanout(
     State(fan): State<Fanout>,
     Query(Width { width }): Query<Width>,
@@ -142,6 +150,7 @@ fn main() -> std::io::Result<()> {
     let Cli { server: args } = arguments::parse_cli();
     security::require_tls_or_none(&args.common, "axum");
     let interface = args.single_interface("axum").clone();
+    let prepared = args.download_body();
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.worker_threads(args.common.threads.0.get());
     runtime.enable_all().build()?.block_on(async {
@@ -151,12 +160,17 @@ fn main() -> std::io::Result<()> {
             .route("/raw", post(raw))
             .route("/tool", post(tool))
             .route("/tool/{name}", post(full))
-            .route("/context", put(context))
+            .route(
+                "/context",
+                put(context).get(move |Query(query): Query<payloads::DownloadQuery>| {
+                    std::future::ready(download(&prepared, query))
+                }),
+            )
             .route("/fanout", post(fanout))
             .route("/stats", get(|| async { (JSON, stats::unit_json()) }))
             .route(
                 "/health",
-                get(|| async { (JSON, payloads::health("axum", "hyper", false)) }),
+                get(|| async { (JSON, payloads::health("axum", "hyper", None)) }),
             )
             .with_state(Fanout::new(&args)?);
         let workers = tokio::runtime::Handle::current().metrics().num_workers();
